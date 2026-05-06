@@ -1,0 +1,4 @@
+ledger_file,ledger_name,year,old_code,old_name,old_full_name,new_code,new_name,new_parent_code,action,conflict_type,reason,confirmed
+D:\客户A原始账套\2020.AIS,2020,2020,550201,办公费,,550201,办公费,5502,keep,,,Y
+D:\客户A原始账套\2021.AIS,2021,2021,550201,差旅费,,550202,差旅费,5502,recode,同编码多名称,同一编码对应不同科目名称，必须重新编码,Y
+D:\客户A原始账套\2020.AIS,2020,2020,6602,管理费用,,660203,管理费用-2020专用,6602,create_year_dedicated_child,父级科目被凭证使用,本年度凭证直接使用父级科目,Y
