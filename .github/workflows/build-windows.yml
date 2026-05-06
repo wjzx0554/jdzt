@@ -1,0 +1,65 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build ${{ matrix.suffix }} EXE
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python_arch: x64
+            suffix: x64
+          - python_arch: x86
+            suffix: x86
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python_arch }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Show Python info
+        shell: cmd
+        run: |
+          python -c "import platform,sys; print(sys.executable); print(platform.architecture()[0]); print(sys.version)"
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build GUI EXE
+        shell: cmd
+        run: |
+          pyinstaller --clean --noconfirm --onefile --noconsole --name KIS_MultiYear_Standardizer_GUI_${{ matrix.suffix }} --hidden-import pyodbc kis_standardizer_gui.py
+
+      - name: Build CLI EXE
+        shell: cmd
+        run: |
+          pyinstaller --clean --noconfirm --onefile --console --name KIS_MultiYear_Standardizer_CLI_${{ matrix.suffix }} --hidden-import pyodbc kis_multi_year_account_standardizer.py
+
+      - name: Prepare release folder
+        shell: cmd
+        run: |
+          mkdir release
+          copy dist\*.exe release\
+          copy config.template.json release\
+          copy mapping_template.csv release\
+          copy README.md release\
+          copy Access_ODBC_IM002修复说明.md release\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KIS-Standardizer-Windows-${{ matrix.suffix }}
+          path: release/*
