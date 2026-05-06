@@ -1,0 +1,20 @@
+{
+  "account_table_candidates": ["GLAcct", "t_Account", "Account", "Acct"],
+  "account_code_candidates": ["FAcctID", "FNumber", "FCode", "AcctCode", "AccountCode", "科目编码"],
+  "account_name_candidates": ["FName", "FAcctName", "FAccountName", "FDetailName", "科目名称"],
+  "account_fullname_candidates": ["FFullName", "FullName", "科目全名"],
+  "parent_code_candidates": ["FParentID", "FParentCode", "ParentCode", "上级科目编码"],
+  "known_reference_fields": {
+    "GLBal": ["FAcctID", "FNumber", "FCode"],
+    "GLVch": ["FAcctID", "FNumber", "FCode"],
+    "GLVchEntry": ["FAcctID", "FNumber", "FCode"],
+    "GLObj": ["FAcctID", "FNumber", "FCode"],
+    "GLCash": ["FAcctID", "FNumber", "FCode"],
+    "GLMultiBal": ["FAcctID", "FNumber", "FCode"]
+  },
+  "auto_reference_field_names": ["FAcctID", "FNumber", "FCode", "AcctCode", "AccountCode"],
+  "voucher_reference_tables": ["GLVch", "GLVchEntry"],
+  "balance_reference_tables": ["GLBal", "GLMultiBal"],
+  "year_dedicated_child_suffix": "专用",
+  "generated_code_width": 2
+}
