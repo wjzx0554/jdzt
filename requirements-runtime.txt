@@ -1,0 +1,2 @@
+# Runtime dependencies
+pyodbc>=5.0.0
