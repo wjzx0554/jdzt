@@ -11,16 +11,17 @@ DEFAULT_CONFIG={
  'account_name_candidates':['FName','FAcctName','FAccountName','FDetailName','科目名称'],
  'account_fullname_candidates':['FFullName','FullName','科目全名'],
  'parent_code_candidates':['FParentID','FParentCode','ParentCode','上级科目编码'],
- 'known_reference_fields':{'GLBal':['FAcctID','FNumber','FCode'],'GLVch':['FAcctID','FNumber','FCode'],'GLVchEntry':['FAcctID','FNumber','FCode'],'GLObj':['FAcctID','FNumber','FCode'],'GLCash':['FAcctID','FNumber','FCode'],'GLMultiBal':['FAcctID','FNumber','FCode']},
+ 'known_reference_fields':{'GLBal':['FAcctID','FNumber','FCode'],'GLBalHist':['FAcctID','FNumber','FCode'],'GLInitBal':['FAcctID','FNumber','FCode'],'GLVch':['FAcctID','FNumber','FCode'],'GLVchEntry':['FAcctID','FNumber','FCode'],'GLObj':['FAcctID','FNumber','FCode'],'GLCash':['FAcctID','FNumber','FCode'],'GLMultiBal':['FAcctID','FNumber','FCode']},
  'auto_reference_field_names':['FAcctID','FNumber','FCode','AcctCode','AccountCode'],
  'voucher_reference_tables':['GLVch','GLVchEntry'],
- 'balance_reference_tables':['GLBal','GLMultiBal'],
+ 'balance_reference_tables':['GLBal','GLBalHist','GLInitBal','GLMultiBal'],
  'year_dedicated_child_suffix':'专用',
  'generated_code_width':2,
  'access_systemdb':'',
  'access_systemdb_candidates':['System.mda','临时存储文件/System.mda'],
  'access_uid':'morningstar',
- 'access_pwd':'ypbwkfyjhyhgzj'
+ 'access_pwd':'ypbwkfyjhyhgzj',
+ 'access_text_encoding':'gb18030'
 }
 
 def load_config(path=None):
@@ -40,7 +41,13 @@ def load_config_for_args(a):
     return cfg
 
 def year_of(p):
-    m=re.search(r'(19|20)\d{2}',str(p)); return m.group(0) if m else ''
+    path=Path(p)
+    parts=[path.stem]+[x.name for x in path.parents if x.name]
+    for part in parts:
+        years=re.findall(r'(?:19|20)\d{2}',str(part))
+        if len(years)==1: return years[0]
+    m=re.search(r'(?:19|20)\d{2}',str(p))
+    return m.group(0) if m else ''
 
 def ledgers(root):
     return sorted([p for p in Path(root).rglob('*') if p.is_file() and p.suffix.lower() in LEDGER_SUFFIXES])
@@ -79,11 +86,13 @@ def access_conn_str(driver,dbq,opts):
     return ';'.join(parts)+';'
 
 def find_systemdb(cfg,file_path):
-    roots=[Path(file_path).resolve().parent,Path.cwd(),app_dir()]
     raw=[]
     if os.environ.get('KIS_SYSTEMDB'): raw.append(os.environ['KIS_SYSTEMDB'])
     if cfg.get('access_systemdb'): raw.append(cfg.get('access_systemdb'))
-    raw+=list(cfg.get('access_systemdb_candidates') or [])
+    for item in raw:
+        if item and Path(item).exists() and Path(item).is_file(): return str(Path(item))
+    roots=[app_dir(),Path.cwd(),Path(file_path).resolve().parent]
+    raw=list(cfg.get('access_systemdb_candidates') or [])
     seen=set()
     for item in raw:
         if not item: continue
@@ -96,6 +105,19 @@ def find_systemdb(cfg,file_path):
             seen.add(key)
             if c.exists() and c.is_file(): return str(c)
     return ''
+
+def configure_access_decoding(conn,cfg):
+    encoding=str(cfg.get('access_text_encoding') or '').strip()
+    if not encoding: return
+    try:
+        import pyodbc
+        for sql_type in [getattr(pyodbc,'SQL_CHAR',None),getattr(pyodbc,'SQL_WCHAR',None),getattr(pyodbc,'SQL_WMETADATA',None)]:
+            if sql_type is not None:
+                try: conn.setdecoding(sql_type,encoding=encoding)
+                except Exception: pass
+        try: conn.setencoding(encoding=encoding)
+        except Exception: pass
+    except Exception: pass
 
 def access_login_options(cfg,systemdb):
     out=[]; seen=set()
@@ -133,6 +155,20 @@ def ledger_header_hint(file_path,systemdb):
         return '检测到账套不是普通 MDB 文件头；这类金蝶老 AIS 通常必须提供金蝶 System.mda 工作组文件。'
     return ''
 
+def sql_value(v):
+    if v is None: return ''
+    return str(v).strip()
+
+def year_from_value(v):
+    m=re.search(r'(?:19|20)\d{2}',sql_value(v))
+    return m.group(0) if m else ''
+
+def parent_from_code(code,lengths):
+    code=sql_value(code)
+    if not code: return ''
+    smaller=[x for x in lengths if x<len(code)]
+    return code[:max(smaller)] if smaller else ''
+
 class AccessDB:
     def __init__(self,cfg): self.cfg=cfg
     def connect(self,file_path):
@@ -156,7 +192,10 @@ class AccessDB:
         for p in paths:
             for d in cand:
                 for opts,label in logins:
-                    try: return pyodbc.connect(access_conn_str(d,p,opts),autocommit=False)
+                    try:
+                        conn=pyodbc.connect(access_conn_str(d,p,opts),autocommit=False)
+                        configure_access_decoding(conn,self.cfg)
+                        return conn
                     except Exception as e:
                         last=e; attempts.append({'path':p,'driver':d,'login':label,'error':compact_error(e)})
         hints=[]
@@ -168,18 +207,43 @@ class AccessDB:
         if hh: hints.append(hh)
         raise RuntimeError('无法连接账套：%s\nEXE/Python 位数：%s\n已发现 Access 驱动：%s\nSystem.mda：%s\n提示：%s\n连接尝试：\n%s\n最后错误：%s'%(file_path,platform.architecture()[0],cand,systemdb or '未找到','；'.join(hints) or '无',format_attempts(attempts),last))
     def tables(self,conn):
-        return sorted(set([r.table_name for r in conn.cursor().tables(tableType='TABLE') if r.table_name and not str(r.table_name).startswith('MSys')]))
-    def cols(self,conn,t): return [r.column_name for r in conn.cursor().columns(table=t)]
+        try:
+            return sorted(set([r.table_name for r in conn.cursor().tables(tableType='TABLE') if r.table_name and not str(r.table_name).startswith('MSys')]))
+        except Exception:
+            out=[]
+            for t in ['GLPref','GLCompany','GLAcct','GLBal','GLBalHist','GLInitBal','GLVch','GLObj','GLCash','GLMultiBal']:
+                if self.table_exists(conn,t): out.append(t)
+            return out
+    def table_exists(self,conn,t):
+        try:
+            conn.cursor().execute('SELECT TOP 1 * FROM [%s]'%t)
+            return True
+        except Exception: return False
+    def cols(self,conn,t):
+        try:
+            return [r.column_name for r in conn.cursor().columns(table=t)]
+        except Exception:
+            cur=conn.cursor(); cur.execute('SELECT * FROM [%s] WHERE 1=0'%t)
+            return [d[0] for d in cur.description]
     def pick(self,cols,cands):
         m={c.lower():c for c in cols}
         for x in cands:
             if x.lower() in m: return m[x.lower()]
         return None
     def account_table(self,conn):
-        tabs=self.tables(conn); low={t.lower():t for t in tabs}; table=None
+        table=None
         for c in self.cfg['account_table_candidates']:
-            if c.lower() in low: table=low[c.lower()]; break
+            try:
+                cs=self.cols(conn,c)
+                if self.pick(cs,self.cfg['account_code_candidates']) and self.pick(cs,self.cfg['account_name_candidates']):
+                    table=c; break
+            except Exception: pass
         if not table:
+            tabs=self.tables(conn); low={t.lower():t for t in tabs}
+            for c in self.cfg['account_table_candidates']:
+                if c.lower() in low: table=low[c.lower()]; break
+        if not table:
+            tabs=self.tables(conn)
             for t in tabs:
                 cs=self.cols(conn,t)
                 if self.pick(cs,self.cfg['account_code_candidates']) and self.pick(cs,self.cfg['account_name_candidates']): table=t; break
@@ -189,10 +253,10 @@ class AccessDB:
         if not f['code'] or not f['name']: raise RuntimeError('科目表无法识别编码/名称字段：%s %s'%(table,cs))
         return table,f
     def count_usage(self,conn,code):
-        vc=bc=0; tabs=set(self.tables(conn))
+        vc=bc=0
         for group,typ in [('voucher_reference_tables','v'),('balance_reference_tables','b')]:
             for t in self.cfg.get(group,[]):
-                if t not in tabs: continue
+                if not self.table_exists(conn,t): continue
                 cs=self.cols(conn,t)
                 for c in self.cfg['auto_reference_field_names']:
                     if c in cs:
@@ -202,9 +266,41 @@ class AccessDB:
                             else: bc+=n
                         except Exception: pass
         return vc,bc
+    def one(self,conn,sql):
+        cur=conn.cursor(); cur.execute(sql); row=cur.fetchone()
+        if not row: return {}
+        return {cur.description[i][0]:row[i] for i in range(len(cur.description))}
+    def ledger_info(self,conn,file):
+        info={'ledger_file':str(file),'ledger_name':Path(file).stem,'year':year_of(file),'company_name':'','start_year':'','current_year':'','start_period':'','current_period':'','voucher_start_date':'','voucher_end_date':''}
+        try:
+            r=self.one(conn,'SELECT FCompany,FStartYear,FStartPeriod,FCurrYear,FCurrPeriod,FNaturalStartYear FROM [GLPref]')
+            info.update({'company_name':sql_value(r.get('FCompany')),'start_year':year_from_value(r.get('FStartYear')),'current_year':year_from_value(r.get('FCurrYear')),'start_period':sql_value(r.get('FStartPeriod')),'current_period':sql_value(r.get('FCurrPeriod'))})
+        except Exception: pass
+        try:
+            r=self.one(conn,'SELECT MIN(FDate) AS MinDate, MAX(FDate) AS MaxDate FROM [GLVch]')
+            info.update({'voucher_start_date':sql_value(r.get('MinDate')),'voucher_end_date':sql_value(r.get('MaxDate'))})
+        except Exception: pass
+        for y in [info.get('current_year'),info.get('start_year'),year_from_value(info.get('voucher_end_date')),year_from_value(info.get('voucher_start_date')),year_of(file)]:
+            if y:
+                info['year']=y; break
+        return info
+    def account_code_lengths(self,conn):
+        try:
+            r=self.one(conn,'SELECT FAcLen1,FAcLen2,FAcLen3,FAcLen4,FAcLen5,FAcLen6 FROM [GLPref]')
+            return sorted(set([int(r[k]) for k in r if sql_value(r[k]).isdigit() and int(r[k])>0]))
+        except Exception: return []
+    def schema_rows(self,conn,file,account_table):
+        out=[]
+        for t in self.tables(conn):
+            try: cols=', '.join(self.cols(conn,t))
+            except Exception as e: cols='读取字段失败：%s'%e
+            out.append({'账套文件':str(file),'表名':t,'字段':cols,'是否科目表':'Y' if t==account_table else ''})
+        return out
     def read_accounts(self,file):
         conn=self.connect(str(file))
         try:
+            info=self.ledger_info(conn,file)
+            code_lengths=self.account_code_lengths(conn)
             table,f=self.account_table(conn); fields=[x for x in f.values() if x]
             cur=conn.cursor(); cur.execute('SELECT '+','.join('[%s]'%x for x in fields)+' FROM [%s]'%table)
             out=[]
@@ -213,8 +309,9 @@ class AccessDB:
                 code=d.get(f['code'],''); name=d.get(f['name'],'')
                 if not code: continue
                 vc,bc=self.count_usage(conn,code)
-                out.append({'ledger_file':str(file),'ledger_name':Path(file).stem,'year':year_of(file),'account_table':table,'old_code':code,'old_name':name,'old_full_name':d.get(f.get('fullname') or '', ''),'old_parent_code':d.get(f.get('parent') or '', ''),'used_in_voucher':vc,'used_in_balance':bc})
-            schema=[{'账套文件':str(file),'表名':t,'字段':', '.join(self.cols(conn,t)),'是否科目表':'Y' if t==table else ''} for t in self.tables(conn)]
+                parent=d.get(f.get('parent') or '', '') or parent_from_code(code,code_lengths)
+                out.append({**info,'account_table':table,'old_code':code,'old_name':name,'old_full_name':d.get(f.get('fullname') or '', ''),'old_parent_code':parent,'used_in_voucher':vc,'used_in_balance':bc})
+            schema=self.schema_rows(conn,file,table)
             return out,schema
         finally: conn.close()
     def refs(self,conn):

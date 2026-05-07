@@ -15,7 +15,7 @@
 
 老账套，尤其 2001—2007 年账套，优先使用 x86/32 位版本。
 
-金蝶 KIS 迷你版/标准版老 `.AIS` 往往不是普通 MDB，需要 Access/Jet 工作组文件 `System.mda`。发布包会把该文件放在 `临时存储文件/System.mda`；如果使用自己的金蝶环境，也可以在界面选择 `System.mda`，或在 `config.json` 中设置 `access_systemdb` 为完整路径。
+金蝶 KIS 迷你版/标准版老 `.AIS` 往往不是普通 MDB，需要 Access/Jet 工作组文件 `System.mda`。发布包会把该文件放在 `临时存储文件/System.mda`，程序会自动使用；如果使用自己的金蝶环境，也可以在 `config.json` 中设置 `access_systemdb` 为完整路径。
 
 ## GitHub Actions 自动打包
 

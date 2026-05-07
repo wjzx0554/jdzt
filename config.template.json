@@ -6,6 +6,8 @@
   "parent_code_candidates": ["FParentID", "FParentCode", "ParentCode", "上级科目编码"],
   "known_reference_fields": {
     "GLBal": ["FAcctID", "FNumber", "FCode"],
+    "GLBalHist": ["FAcctID", "FNumber", "FCode"],
+    "GLInitBal": ["FAcctID", "FNumber", "FCode"],
     "GLVch": ["FAcctID", "FNumber", "FCode"],
     "GLVchEntry": ["FAcctID", "FNumber", "FCode"],
     "GLObj": ["FAcctID", "FNumber", "FCode"],
@@ -14,11 +16,12 @@
   },
   "auto_reference_field_names": ["FAcctID", "FNumber", "FCode", "AcctCode", "AccountCode"],
   "voucher_reference_tables": ["GLVch", "GLVchEntry"],
-  "balance_reference_tables": ["GLBal", "GLMultiBal"],
+  "balance_reference_tables": ["GLBal", "GLBalHist", "GLInitBal", "GLMultiBal"],
   "year_dedicated_child_suffix": "专用",
   "generated_code_width": 2,
   "access_systemdb": "",
   "access_systemdb_candidates": ["System.mda", "临时存储文件/System.mda"],
   "access_uid": "morningstar",
-  "access_pwd": "ypbwkfyjhyhgzj"
+  "access_pwd": "ypbwkfyjhyhgzj",
+  "access_text_encoding": "gb18030"
 }
