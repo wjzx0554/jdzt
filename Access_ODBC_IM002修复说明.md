@@ -23,7 +23,7 @@ KIS_MultiYear_Standardizer_GUI_x86.exe
 
 ## 金蝶 System.mda
 
-很多 KIS 迷你版/标准版 `.AIS` 需要金蝶工作组文件 `System.mda` 才能打开。可把金蝶安装目录中的 `System.mda`，或“金蝶引出处理工具”目录里的 `临时存储文件/System.mda`，复制到 exe 同目录或 exe 同目录的 `临时存储文件` 下。
+很多 KIS 迷你版/标准版 `.AIS` 需要金蝶工作组文件 `System.mda` 才能打开。发布包会把该文件放在 exe 同目录的 `临时存储文件/System.mda` 下；如果使用自己的金蝶环境，也可以在界面选择其他 `System.mda`，或在 `config.json` 中设置完整路径。
 
 如果不想复制文件，也可以在 `config.json` 中设置：
 

@@ -33,6 +33,12 @@ def load_config(path=None):
             else: cfg[k]=v
     return cfg
 
+def load_config_for_args(a):
+    cfg=load_config(getattr(a,'config',None))
+    systemdb=getattr(a,'systemdb',None)
+    if systemdb: cfg['access_systemdb']=systemdb
+    return cfg
+
 def year_of(p):
     m=re.search(r'(19|20)\d{2}',str(p)); return m.group(0) if m else ''
 
@@ -303,7 +309,7 @@ def cmd_make_config(a):
     with open(a.out,'w',encoding='utf-8') as f: json.dump(DEFAULT_CONFIG,f,ensure_ascii=False,indent=2)
     print('已生成配置：',a.out)
 def cmd_inspect(a):
-    cfg=load_config(a.config); db=AccessDB(cfg); accounts=[]; schemas=[]; errs=[]
+    cfg=load_config_for_args(a); db=AccessDB(cfg); accounts=[]; schemas=[]; errs=[]
     for f in ledgers(a.input):
         print('读取',f)
         try:
@@ -314,7 +320,7 @@ def cmd_inspect(a):
     maps,std,ex=build_plan(accounts,cfg); write_csv(out/'03_标准科目表_草稿.csv',std); write_csv(out/'04_科目旧新映射_草稿.csv',maps); write_csv(out/'05_冲突和需人工确认清单.csv',ex)
     print('完成，输出目录：',out)
 def cmd_apply(a):
-    cfg=load_config(a.config); db=AccessDB(cfg); rows=read_csv(a.mapping); by=defaultdict(list); skipped=[]
+    cfg=load_config_for_args(a); db=AccessDB(cfg); rows=read_csv(a.mapping); by=defaultdict(list); skipped=[]
     for r in rows:
         if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         by[r['ledger_file']].append(r)
@@ -330,7 +336,7 @@ def main():
     p=argparse.ArgumentParser(description='金蝶 KIS 多年账套科目标准化工具')
     sub=p.add_subparsers(dest='cmd',required=True)
     q=sub.add_parser('make-config'); q.add_argument('--out',required=True); q.set_defaults(func=cmd_make_config)
-    q=sub.add_parser('inspect'); q.add_argument('--input',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.set_defaults(func=cmd_inspect)
-    q=sub.add_parser('apply'); q.add_argument('--mapping',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--dry-run',action='store_true',default=True); q.add_argument('--commit',dest='dry_run',action='store_false'); q.add_argument('--allow-unconfirmed',action='store_true'); q.set_defaults(func=cmd_apply)
+    q=sub.add_parser('inspect'); q.add_argument('--input',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.set_defaults(func=cmd_inspect)
+    q=sub.add_parser('apply'); q.add_argument('--mapping',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.add_argument('--dry-run',action='store_true',default=True); q.add_argument('--commit',dest='dry_run',action='store_false'); q.add_argument('--allow-unconfirmed',action='store_true'); q.set_defaults(func=cmd_apply)
     a=p.parse_args(); a.func(a)
 if __name__=='__main__': main()

@@ -57,6 +57,10 @@ jobs:
           copy mapping_template.csv release\
           copy README.md release\
           copy Access_ODBC_IM002修复说明.md release\
+          if exist 临时存储文件\System.mda (
+            mkdir release\临时存储文件
+            copy 临时存储文件\System.mda release\临时存储文件\
+          )
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
