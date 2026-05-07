@@ -8,6 +8,7 @@
     "GLBal": ["FAcctID", "FNumber", "FCode"],
     "GLBalHist": ["FAcctID", "FNumber", "FCode"],
     "GLInitBal": ["FAcctID", "FNumber", "FCode"],
+    "GLInitData": ["FAcctID"],
     "GLVch": ["FAcctID", "FNumber", "FCode"],
     "GLVchEntry": ["FAcctID", "FNumber", "FCode"],
     "GLObj": ["FAcctID", "FNumber", "FCode"],
