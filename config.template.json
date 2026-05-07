@@ -16,5 +16,9 @@
   "voucher_reference_tables": ["GLVch", "GLVchEntry"],
   "balance_reference_tables": ["GLBal", "GLMultiBal"],
   "year_dedicated_child_suffix": "专用",
-  "generated_code_width": 2
+  "generated_code_width": 2,
+  "access_systemdb": "",
+  "access_systemdb_candidates": ["System.mda", "临时存储文件/System.mda"],
+  "access_uid": "morningstar",
+  "access_pwd": "ypbwkfyjhyhgzj"
 }

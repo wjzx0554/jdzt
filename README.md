@@ -15,6 +15,8 @@
 
 老账套，尤其 2001—2007 年账套，优先使用 x86/32 位版本。
 
+金蝶 KIS 迷你版/标准版老 `.AIS` 往往不是普通 MDB，需要 Access/Jet 工作组文件 `System.mda`。请把金蝶安装目录中的 `System.mda`，或“金蝶引出处理工具”目录里的 `临时存储文件/System.mda`，放到 exe 同目录或 exe 同目录的 `临时存储文件` 下；也可以在 `config.json` 中设置 `access_systemdb` 为完整路径。
+
 ## GitHub Actions 自动打包
 
 本仓库包含：
@@ -39,6 +41,7 @@ KIS_MultiYear_Standardizer_CLI_x64.exe
 - x86 exe 需要 32 位 Access/Jet/ACE 驱动。
 - x64 exe 需要 64 位 Access/ACE 驱动。
 - 2001—2007 年老账套优先使用 x86 exe + 32 位驱动。
+- KIS 老账套默认会尝试 `System.mda + morningstar/ypbwkfyjhyhgzj` 工作组登录；如果你的账套环境不同，可在 `config.json` 修改 `access_uid` 和 `access_pwd`。
 
 如果报 IM002，说明当前 exe 位数下看不到 Access ODBC 驱动。
 

@@ -21,6 +21,20 @@ KIS_MultiYear_Standardizer_GUI_x86.exe
 
 并在运行电脑上安装 32 位 Access/Jet/ACE 驱动。
 
+## 金蝶 System.mda
+
+很多 KIS 迷你版/标准版 `.AIS` 需要金蝶工作组文件 `System.mda` 才能打开。可把金蝶安装目录中的 `System.mda`，或“金蝶引出处理工具”目录里的 `临时存储文件/System.mda`，复制到 exe 同目录或 exe 同目录的 `临时存储文件` 下。
+
+如果不想复制文件，也可以在 `config.json` 中设置：
+
+```json
+{
+  "access_systemdb": "E:/金蝶AIS账套数据引出工具V1.0/临时存储文件/System.mda",
+  "access_uid": "morningstar",
+  "access_pwd": "ypbwkfyjhyhgzj"
+}
+```
+
 ## 注意
 
 Access/Jet/ACE 驱动不能简单打包进 exe，通常必须安装到系统中，因为它依赖注册表、ODBC 驱动管理器和 COM/OLEDB 组件。

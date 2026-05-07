@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import argparse, csv, json, os, re, shutil, tempfile, platform
+import argparse, csv, json, os, re, shutil, tempfile, platform, sys
 from pathlib import Path
 from collections import defaultdict
 
@@ -16,7 +16,11 @@ DEFAULT_CONFIG={
  'voucher_reference_tables':['GLVch','GLVchEntry'],
  'balance_reference_tables':['GLBal','GLMultiBal'],
  'year_dedicated_child_suffix':'专用',
- 'generated_code_width':2
+ 'generated_code_width':2,
+ 'access_systemdb':'',
+ 'access_systemdb_candidates':['System.mda','临时存储文件/System.mda'],
+ 'access_uid':'morningstar',
+ 'access_pwd':'ypbwkfyjhyhgzj'
 }
 
 def load_config(path=None):
@@ -47,15 +51,91 @@ def write_csv(path,rows):
 def read_csv(path):
     with open(path,'r',encoding='utf-8-sig',newline='') as f: return list(csv.DictReader(f))
 
+def app_dir():
+    if getattr(sys,'frozen',False): return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def is_access_odbc_driver(name):
+    dl=str(name).lower()
+    if any(x in dl for x in ('text','txt','csv','excel','xls','dbase','dbf','paradox')):
+        return False
+    return 'access' in dl and '.mdb' in dl
+
+def odbc_value(value):
+    s='' if value is None else str(value)
+    if any(ch in s for ch in ';{}') or s!=s.strip():
+        return '{%s}'%s.replace('}','}}')
+    return s
+
+def access_conn_str(driver,dbq,opts):
+    parts=['DRIVER={%s}'%driver,'DBQ=%s'%odbc_value(dbq)]
+    for k,v in opts: parts.append('%s=%s'%(k,odbc_value(v)))
+    return ';'.join(parts)+';'
+
+def find_systemdb(cfg,file_path):
+    roots=[Path(file_path).resolve().parent,Path.cwd(),app_dir()]
+    raw=[]
+    if os.environ.get('KIS_SYSTEMDB'): raw.append(os.environ['KIS_SYSTEMDB'])
+    if cfg.get('access_systemdb'): raw.append(cfg.get('access_systemdb'))
+    raw+=list(cfg.get('access_systemdb_candidates') or [])
+    seen=set()
+    for item in raw:
+        if not item: continue
+        p=Path(item)
+        checks=[p] if p.is_absolute() else [r/p for r in roots]
+        for c in checks:
+            try: key=str(c.resolve()).lower()
+            except Exception: key=str(c).lower()
+            if key in seen: continue
+            seen.add(key)
+            if c.exists() and c.is_file(): return str(c)
+    return ''
+
+def access_login_options(cfg,systemdb):
+    out=[]; seen=set()
+    def add(opts,label):
+        key=tuple(opts)
+        if key not in seen:
+            seen.add(key); out.append((opts,label))
+    if systemdb:
+        uid=str(cfg.get('access_uid') or 'morningstar'); pwd=str(cfg.get('access_pwd') or 'ypbwkfyjhyhgzj')
+        add([('SystemDB',systemdb),('UID',uid),('PWD',pwd)],'System.mda + %s'%uid)
+        add([('SystemDB',systemdb),('UID','morningstar'),('PWD','ypbwkfyjhyhgzj')],'System.mda + morningstar')
+        add([('SystemDB',systemdb),('UID','Admin'),('PWD','')],'System.mda + Admin')
+    add([],'无 System.mda')
+    return out
+
+def compact_error(e):
+    return re.sub(r'\s+',' ',str(e)).strip()
+
+def format_attempts(attempts,limit=10):
+    if not attempts: return ''
+    rows=[]
+    for a in attempts[-limit:]:
+        rows.append(' - %s | %s | %s -> %s'%(Path(a['path']).name,a['driver'],a['login'],a['error'][:360]))
+    more=len(attempts)-limit
+    if more>0: rows.insert(0,' - 前面还有 %s 次尝试，已省略。'%more)
+    return '\n'.join(rows)
+
+def ledger_header_hint(file_path,systemdb):
+    try: head=Path(file_path).read_bytes()[:128]
+    except Exception: return ''
+    if b'Standard Jet DB' in head: return ''
+    if str(file_path).lower().endswith(('.ais','.aiy','.axx')):
+        if systemdb:
+            return '检测到账套不是普通 MDB 文件头；这类金蝶老 AIS 通常必须使用 x86 工具 + 32 位 Jet 驱动 + System.mda。'
+        return '检测到账套不是普通 MDB 文件头；这类金蝶老 AIS 通常必须提供金蝶 System.mda 工作组文件。'
+    return ''
+
 class AccessDB:
     def __init__(self,cfg): self.cfg=cfg
     def connect(self,file_path):
         import pyodbc
         installed=list(pyodbc.drivers())
-        cand=[]
-        for d in ['Microsoft Access Driver (*.mdb, *.accdb)','Microsoft Access Driver (*.mdb)']+installed:
-            dl=d.lower()
-            if 'access' in dl and ('.mdb' in dl or '.accdb' in dl or 'microsoft access' in dl):
+        cand=[]; installed_lower={str(d).lower():d for d in installed}
+        preferred=[installed_lower[p.lower()] for p in ['Microsoft Access Driver (*.mdb, *.accdb)','Microsoft Access Driver (*.mdb)'] if p.lower() in installed_lower]
+        for d in preferred+installed:
+            if is_access_odbc_driver(d):
                 if d not in cand: cand.append(d)
         if not cand:
             raise RuntimeError('当前 EXE/Python 位数下没有发现 Access ODBC 驱动。位数：%s；可见驱动：%s。老账套建议使用 x86 版本和 32 位 Access/Jet 驱动。'%(platform.architecture()[0],installed))
@@ -64,12 +144,23 @@ class AccessDB:
             try:
                 td=tempfile.mkdtemp(prefix='kis_ais_'); tmp=os.path.join(td,Path(file_path).name+'.mdb'); shutil.copy2(file_path,tmp); paths.append(tmp)
             except Exception: pass
-        last=None
+        systemdb=find_systemdb(self.cfg,file_path)
+        logins=access_login_options(self.cfg,systemdb)
+        last=None; attempts=[]
         for p in paths:
             for d in cand:
-                try: return pyodbc.connect('DRIVER={%s};DBQ=%s;'%(d,p),autocommit=False)
-                except Exception as e: last=e
-        raise RuntimeError('无法连接账套：%s\nEXE/Python 位数：%s\n已发现 Access 驱动：%s\n最后错误：%s'%(file_path,platform.architecture()[0],cand,last))
+                for opts,label in logins:
+                    try: return pyodbc.connect(access_conn_str(d,p,opts),autocommit=False)
+                    except Exception as e:
+                        last=e; attempts.append({'path':p,'driver':d,'login':label,'error':compact_error(e)})
+        hints=[]
+        if platform.architecture()[0]=='64bit':
+            hints.append('当前是 64bit。2001—2007 年金蝶老 AIS 优先运行 KIS_MultiYear_Standardizer_GUI_x86.exe，并安装/使用 32 位 Microsoft Access Driver (*.mdb)。')
+        if not systemdb:
+            hints.append('未找到 System.mda。请把金蝶安装目录或“金蝶引出处理工具”的“临时存储文件/System.mda”放到 exe 同目录、exe 同目录的“临时存储文件”下，或在 config.json 设置 access_systemdb。')
+        hh=ledger_header_hint(file_path,systemdb)
+        if hh: hints.append(hh)
+        raise RuntimeError('无法连接账套：%s\nEXE/Python 位数：%s\n已发现 Access 驱动：%s\nSystem.mda：%s\n提示：%s\n连接尝试：\n%s\n最后错误：%s'%(file_path,platform.architecture()[0],cand,systemdb or '未找到','；'.join(hints) or '无',format_attempts(attempts),last))
     def tables(self,conn):
         return sorted(set([r.table_name for r in conn.cursor().tables(tableType='TABLE') if r.table_name and not str(r.table_name).startswith('MSys')]))
     def cols(self,conn,t): return [r.column_name for r in conn.cursor().columns(table=t)]
