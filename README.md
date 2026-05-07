@@ -43,6 +43,7 @@ KIS_MultiYear_Standardizer_CLI_x64.exe
 - 2001—2007 年老账套优先使用 x86 exe + 32 位驱动。
 - KIS 老账套默认会尝试 `System.mda + morningstar/ypbwkfyjhyhgzj` 工作组登录；如果你的账套环境不同，可在 `config.json` 修改 `access_uid` 和 `access_pwd`。
 - 换电脑使用时，请保持 exe 与 `临时存储文件/System.mda` 在同一个发布包目录结构中。
+- 正式处理副本时会按映射后的科目编码长度自动更新 `GLPref` 科目级次，支持后续新增下级科目、编码位数扩展或字母编码；超过 6 个不同编码长度时会要求先调整映射。
 
 如果报 IM002，说明当前 exe 位数下看不到 Access ODBC 驱动。
 

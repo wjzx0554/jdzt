@@ -21,7 +21,9 @@ DEFAULT_CONFIG={
  'access_systemdb_candidates':['System.mda','临时存储文件/System.mda'],
  'access_uid':'morningstar',
  'access_pwd':'ypbwkfyjhyhgzj',
- 'access_text_encoding':'gb18030'
+ 'access_text_encoding':'gb18030',
+ 'auto_expand_account_levels':True,
+ 'max_account_levels':6
 }
 
 def load_config(path=None):
@@ -111,7 +113,7 @@ def configure_access_decoding(conn,cfg):
     if not encoding: return
     try:
         import pyodbc
-        for sql_type in [getattr(pyodbc,'SQL_CHAR',None),getattr(pyodbc,'SQL_WCHAR',None),getattr(pyodbc,'SQL_WMETADATA',None)]:
+        for sql_type in [getattr(pyodbc,'SQL_CHAR',None),getattr(pyodbc,'SQL_WCHAR',None)]:
             if sql_type is not None:
                 try: conn.setdecoding(sql_type,encoding=encoding)
                 except Exception: pass
@@ -169,6 +171,17 @@ def parent_from_code(code,lengths):
     smaller=[x for x in lengths if x<len(code)]
     return code[:max(smaller)] if smaller else ''
 
+def code_lengths(codes):
+    return sorted(set([len(sql_value(c)) for c in codes if sql_value(c)]))
+
+def mapping_code_lengths(rows):
+    codes=[]
+    for r in rows:
+        for k in ['new_code','new_parent_code','old_code','old_parent_code']:
+            v=sql_value(r.get(k,''))
+            if v: codes.append(v)
+    return code_lengths(codes)
+
 class AccessDB:
     def __init__(self,cfg): self.cfg=cfg
     def connect(self,file_path):
@@ -216,15 +229,17 @@ class AccessDB:
             return out
     def table_exists(self,conn,t):
         try:
-            conn.cursor().execute('SELECT TOP 1 * FROM [%s]'%t)
+            conn.cursor().execute('SELECT * FROM [%s] WHERE 1=0'%t)
             return True
         except Exception: return False
     def cols(self,conn,t):
+        cols=[]
         try:
-            return [r.column_name for r in conn.cursor().columns(table=t)]
-        except Exception:
-            cur=conn.cursor(); cur.execute('SELECT * FROM [%s] WHERE 1=0'%t)
-            return [d[0] for d in cur.description]
+            cols=[r.column_name for r in conn.cursor().columns(table=t) if r.column_name]
+        except Exception: pass
+        if cols: return cols
+        cur=conn.cursor(); cur.execute('SELECT * FROM [%s] WHERE 1=0'%t)
+        return [d[0] for d in cur.description]
     def pick(self,cols,cands):
         m={c.lower():c for c in cols}
         for x in cands:
@@ -289,6 +304,41 @@ class AccessDB:
             r=self.one(conn,'SELECT FAcLen1,FAcLen2,FAcLen3,FAcLen4,FAcLen5,FAcLen6 FROM [GLPref]')
             return sorted(set([int(r[k]) for k in r if sql_value(r[k]).isdigit() and int(r[k])>0]))
         except Exception: return []
+    def desired_account_code_lengths(self,conn,maps,table='',code_field=''):
+        codes=[]
+        for n in self.cfg.get('_target_account_lengths') or []:
+            try: codes.append('X'*int(n))
+            except Exception: pass
+        if table and code_field:
+            try:
+                cur=conn.cursor(); cur.execute('SELECT [%s] FROM [%s]'%(code_field,table))
+                for row in cur.fetchall():
+                    if row and row[0] is not None: codes.append(row[0])
+            except Exception: pass
+        for m in maps:
+            for k in ['new_code','new_parent_code','old_code','old_parent_code']:
+                v=sql_value(m.get(k,''))
+                if v: codes.append(v)
+        return code_lengths(codes)
+    def ensure_account_levels(self,conn,cur,maps,table='',code_field='',dry=True):
+        audit=[]
+        if not self.cfg.get('auto_expand_account_levels',True): return audit
+        if not self.table_exists(conn,'GLPref'): return audit
+        desired=self.desired_account_code_lengths(conn,maps,table,code_field)
+        if not desired: return audit
+        max_levels=int(self.cfg.get('max_account_levels',6) or 6)
+        if len(desired)>max_levels:
+            msg='目标科目编码出现 %s 个不同长度：%s；KIS 迷你版通常最多支持 %s 级，请先调整映射编码。'%(len(desired),desired,max_levels)
+            audit.append({'action':'account_level_error','error':msg})
+            if not dry: raise RuntimeError(msg)
+            return audit
+        old=self.account_code_lengths(conn)
+        audit.append({'action':'account_level_plan','old_lengths':','.join(map(str,old)),'new_lengths':','.join(map(str,desired)),'note':'更新 GLPref 科目级次，支持后续下级科目或字母编码'})
+        if old==desired: return audit
+        if not dry:
+            padded=desired+[0]*(6-len(desired))
+            cur.execute('UPDATE [GLPref] SET [FAcLevels]=?, [FAcLen1]=?, [FAcLen2]=?, [FAcLen3]=?, [FAcLen4]=?, [FAcLen5]=?, [FAcLen6]=?',len(desired),padded[0],padded[1],padded[2],padded[3],padded[4],padded[5])
+        return audit
     def schema_rows(self,conn,file,account_table):
         out=[]
         for t in self.tables(conn):
@@ -327,7 +377,7 @@ class AccessDB:
             Path(dst).parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
         conn=self.connect(target); audit=[]
         try:
-            table,f=self.account_table(conn); cf,nf,pf=f['code'],f['name'],f.get('parent'); cur=conn.cursor(); refs=self.refs(conn)
+            table,f=self.account_table(conn); cf,nf,pf=f['code'],f['name'],f.get('parent'); cur=conn.cursor(); refs=self.refs(conn); audit+=self.ensure_account_levels(conn,cur,maps,table,cf,dry)
             for m in maps:
                 old=m['old_code'].strip(); new=m['new_code'].strip(); name=m['new_name'].strip(); parent=m.get('new_parent_code','').strip()
                 if not old or not new: continue
@@ -418,6 +468,7 @@ def cmd_inspect(a):
     print('完成，输出目录：',out)
 def cmd_apply(a):
     cfg=load_config_for_args(a); db=AccessDB(cfg); rows=read_csv(a.mapping); by=defaultdict(list); skipped=[]
+    cfg['_target_account_lengths']=mapping_code_lengths(rows)
     for r in rows:
         if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         by[r['ledger_file']].append(r)

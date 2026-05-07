@@ -23,5 +23,7 @@
   "access_systemdb_candidates": ["System.mda", "临时存储文件/System.mda"],
   "access_uid": "morningstar",
   "access_pwd": "ypbwkfyjhyhgzj",
-  "access_text_encoding": "gb18030"
+  "access_text_encoding": "gb18030",
+  "auto_expand_account_levels": true,
+  "max_account_levels": 6
 }
