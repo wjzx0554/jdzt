@@ -101,6 +101,7 @@ class App(tk.Tk):
         for title in [
             '科目汇总',
             '映射草稿',
+            '问题汇总',
             '标准科目',
             '核算项目',
             '扫描错误',
@@ -349,7 +350,58 @@ class App(tk.Tk):
 
     def refresh_previews(self):
         for title in self.trees:
-            self.load_preview(title)
+            if title == '问题汇总':
+                self.load_issue_summary()
+            else:
+                self.load_preview(title)
+
+    def read_csv_rows(self, path):
+        if not path or not path.exists():
+            return []
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            return list(csv.DictReader(f))
+
+    def load_issue_summary(self):
+        title = '问题汇总'
+        tree = self.trees[title]
+        label = self.tab_labels[title]
+        tree.delete(*tree.get_children())
+        columns = ['来源', '账套组', '账套文件', '级别', '检查项', '旧科目', '新科目', '原因']
+        tree['columns'] = columns
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=150, minwidth=80, stretch=True)
+        rows = []
+        work = Path(self.work_dir.get()) if self.work_dir.get().strip() else None
+        out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
+        sources = [
+            ('扫描错误', work / 'kis_scan_errors.csv' if work else None),
+            ('预检报告', out / 'preflight_report.csv' if out else None),
+            ('引用字段', out / 'reference_fields_report.csv' if out else None),
+            ('试运行审计', out / 'apply_audit_dryrun.csv' if out else None),
+            ('正式审计', out / 'apply_audit_commit.csv' if out else None),
+        ]
+        for source, path in sources:
+            for row in self.read_csv_rows(path):
+                risk = (row.get('risk_level') or row.get('级别') or '').lower()
+                blocked = (row.get('blocked_commit') or '').upper() == 'Y'
+                has_error = row.get('error') or row.get('错误')
+                if source == '扫描错误' or blocked or risk in ('error', 'high', 'warning') or has_error:
+                    rows.append({
+                        '来源': source,
+                        '账套组': row.get('ledger_group', ''),
+                        '账套文件': row.get('source_file') or row.get('ledger_file') or row.get('file') or '',
+                        '级别': row.get('risk_level') or ('error' if has_error else ''),
+                        '检查项': row.get('check') or row.get('action') or row.get('stage') or '',
+                        '旧科目': row.get('old_code', ''),
+                        '新科目': row.get('new_code', ''),
+                        '原因': row.get('reason') or row.get('error') or row.get('错误') or '',
+                    })
+        if not rows:
+            rows.append({'来源': '汇总', '级别': 'info', '检查项': 'ok', '原因': '暂未发现扫描错误或阻断项。'})
+        for row in rows[:PREVIEW_LIMIT]:
+            tree.insert('', tk.END, values=[row.get(col, '') for col in columns])
+        label.configure(text='显示前 %s 行，共 %s 条问题或提示。' % (min(len(rows), PREVIEW_LIMIT), len(rows)))
 
     def load_preview(self, title):
         path = self.preview_path(title)

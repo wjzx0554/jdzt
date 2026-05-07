@@ -5,15 +5,14 @@
   "account_fullname_candidates": ["FFullName", "FullName", "科目全名"],
   "parent_code_candidates": ["FParentID", "FParentCode", "ParentCode", "上级科目编码"],
   "known_reference_fields": {
-    "GLBal": ["FAcctID", "FNumber", "FCode"],
-    "GLBalHist": ["FAcctID", "FNumber", "FCode"],
-    "GLInitBal": ["FAcctID", "FNumber", "FCode"],
+    "GLAcct": ["FAcctID"],
+    "GLVch": ["FAcctID"],
+    "GLVchEntry": ["FAcctID"],
+    "GLBal": ["FAcctID"],
+    "GLBalHist": ["FAcctID"],
+    "GLInitBal": ["FAcctID"],
     "GLInitData": ["FAcctID"],
-    "GLVch": ["FAcctID", "FNumber", "FCode"],
-    "GLVchEntry": ["FAcctID", "FNumber", "FCode"],
-    "GLObj": ["FAcctID", "FNumber", "FCode"],
-    "GLCash": ["FAcctID", "FNumber", "FCode"],
-    "GLMultiBal": ["FAcctID", "FNumber", "FCode"]
+    "GLPref": ["FProfitAcctID", "FLossAcctID", "FYearProfitAcctID", "FYearLossAcctID", "FExchangeGainAcctID", "FExchangeLossAcctID", "FCashAcctID", "FBankAcctID", "FTaxAcctID", "FDefaultAcctID", "FPLAcctID", "FDefAcctID"]
   },
   "auto_reference_field_names": ["FAcctID", "FNumber", "FCode", "AcctCode", "AccountCode"],
   "voucher_reference_tables": ["GLVch", "GLVchEntry"],

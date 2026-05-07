@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import argparse, csv, json, os, re, shutil, tempfile, platform, sys, time
+import argparse, csv, json, os, re, shutil, tempfile, platform, sys, time, hashlib
 from pathlib import Path
 from collections import defaultdict
 
@@ -11,7 +11,7 @@ DEFAULT_CONFIG={
  'account_name_candidates':['FName','FAcctName','FAccountName','FDetailName','科目名称'],
  'account_fullname_candidates':['FFullName','FullName','科目全名'],
  'parent_code_candidates':['FParentID','FParentCode','ParentCode','上级科目编码'],
- 'known_reference_fields':{'GLBal':['FAcctID','FNumber','FCode'],'GLBalHist':['FAcctID','FNumber','FCode'],'GLInitBal':['FAcctID','FNumber','FCode'],'GLInitData':['FAcctID'],'GLVch':['FAcctID','FNumber','FCode'],'GLVchEntry':['FAcctID','FNumber','FCode'],'GLObj':['FAcctID','FNumber','FCode'],'GLCash':['FAcctID','FNumber','FCode'],'GLMultiBal':['FAcctID','FNumber','FCode']},
+ 'known_reference_fields':{'GLAcct':['FAcctID'],'GLVch':['FAcctID'],'GLVchEntry':['FAcctID'],'GLBal':['FAcctID'],'GLBalHist':['FAcctID'],'GLInitBal':['FAcctID'],'GLInitData':['FAcctID'],'GLPref':['FProfitAcctID','FLossAcctID','FYearProfitAcctID','FYearLossAcctID','FExchangeGainAcctID','FExchangeLossAcctID','FCashAcctID','FBankAcctID','FTaxAcctID','FDefaultAcctID','FPLAcctID','FDefAcctID']},
  'auto_reference_field_names':['FAcctID','FNumber','FCode','AcctCode','AccountCode'],
  'voucher_reference_tables':['GLVch','GLVchEntry'],
  'balance_reference_tables':['GLBal','GLBalHist','GLInitBal','GLMultiBal'],
@@ -53,6 +53,42 @@ def year_of(p):
 
 def ledgers(root):
     return sorted([p for p in Path(root).rglob('*') if p.is_file() and p.suffix.lower() in LEDGER_SUFFIXES])
+
+def short_path_id(path):
+    return hashlib.md5(str(path).encode('utf-8','ignore')).hexdigest()[:8]
+
+def clean_group_text(text):
+    s=sql_value(text)
+    s=re.sub(r'(?:19|20)\d{2}', '', s)
+    s=re.sub(r'[_\-—\s]+', '', s)
+    return s
+
+def ledger_group_name(file_path,company_name=''):
+    company=sql_value(company_name)
+    if company: return company
+    p=Path(file_path)
+    for part in [p.stem,p.parent.name,p.parent.parent.name if p.parent else '']:
+        cleaned=clean_group_text(part)
+        if cleaned: return cleaned
+    return p.stem or '未命名账套组'
+
+def ledger_output_paths(out,sources):
+    out=Path(out); counts=defaultdict(int); result={}; used=set()
+    for src in sources:
+        if src: counts[Path(src).name.lower()]+=1
+    for src in sorted([s for s in sources if s]):
+        p=Path(src)
+        if counts[p.name.lower()]<=1:
+            candidate=out/p.name
+        else:
+            parent=p.parent.name or 'ledger'
+            candidate=out/parent/p.name
+        key=str(candidate).lower()
+        if key in used:
+            candidate=candidate.with_name(candidate.stem+'_'+short_path_id(src)+candidate.suffix)
+            key=str(candidate).lower()
+        used.add(key); result[src]=str(candidate)
+    return result
 
 def write_csv(path,rows):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
@@ -384,6 +420,7 @@ class AccessDB:
                 try: vch=self.fast_voucher_bounds(conn); touched.append('GLVch(MIN/MAX)')
                 except Exception as e: errors.append({'ledger_file':str(file),'stage':'GLVch','error':str(e)})
             info={'ledger_file':str(file),'ledger_name':Path(file).stem,'company_name':sql_value(pref.get('FCompany')),'start_year':year_from_value(pref.get('FStartYear')),'current_year':year_from_value(pref.get('FCurrYear')),'start_period':sql_value(pref.get('FStartPeriod')),'current_period':sql_value(pref.get('FCurrPeriod')),'natural_start_year':year_from_value(pref.get('FNaturalStartYear')),'voucher_start_date':sql_value(vch.get('voucher_start_date')),'voucher_end_date':sql_value(vch.get('voucher_end_date')),'voucher_min_year':sql_value(vch.get('voucher_min_year')),'voucher_max_year':sql_value(vch.get('voucher_max_year')),'voucher_min_period':sql_value(vch.get('voucher_min_period')),'voucher_max_period':sql_value(vch.get('voucher_max_period')),'FAcLevels':sql_value(pref.get('FAcLevels')),'FAcLen1':sql_value(pref.get('FAcLen1')),'FAcLen2':sql_value(pref.get('FAcLen2')),'FAcLen3':sql_value(pref.get('FAcLen3')),'FAcLen4':sql_value(pref.get('FAcLen4')),'FAcLen5':sql_value(pref.get('FAcLen5')),'FAcLen6':sql_value(pref.get('FAcLen6'))}
+            info['ledger_group']=ledger_group_name(file,info.get('company_name',''))
             for y in [info.get('current_year'),info.get('start_year'),year_from_value(info.get('voucher_max_year')),year_from_value(info.get('voucher_end_date')),year_of(file)]:
                 if y: info['year']=y; break
             if 'year' not in info: info['year']=''
@@ -495,23 +532,18 @@ class AccessDB:
         finally: conn.close()
     def reference_fields(self,conn,account_table='',account_code_field='',source_file='',dry=True):
         refs=[]; report=[]; known=self.cfg.get('known_reference_fields',{})
-        auto=list(self.cfg.get('auto_reference_field_names') or [])
-        for t in self.tables(conn):
-            try: cs=self.cols(conn,t)
-            except Exception as e:
-                report.append(audit_row(source_file=source_file,table=t,action='reference_field_scan_error',risk_level='error',reason=str(e),dry_run=yn(dry),blocked_commit='Y'))
+        for t,fields in known.items():
+            if not fields: continue
+            if not self.fast_table_exists(conn,t):
                 continue
-            candidates=[]
-            for c in list(known.get(t,[]))+auto:
-                if c in cs and c not in candidates: candidates.append(c)
-            for c in candidates:
-                if t==account_table:
+            for c in fields:
+                if not self.fast_field_exists(conn,t,c):
+                    continue
+                if t.lower()==str(account_table).lower():
                     report.append(audit_row(source_file=source_file,table=t,field=c,action='reference_field_excluded',risk_level='info',reason='科目表字段由独立科目更新逻辑处理，不作为普通引用字段更新',planned_sql_type='NONE',dry_run=yn(dry),blocked_commit='N',safe='N'))
-                elif t in known and c in known.get(t,[]):
-                    refs.append((t,c))
-                    report.append(audit_row(source_file=source_file,table=t,field=c,action='reference_field_safe',risk_level='info',reason='字段在 known_reference_fields 中，允许作为引用字段更新',planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='N',safe='Y'))
                 else:
-                    report.append(audit_row(source_file=source_file,table=t,field=c,action='reference_field_uncertain',risk_level='warning',reason='字段名命中自动候选，但表未显式列入 known_reference_fields，无法确认安全；commit 默认阻止',planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='Y',safe='N'))
+                    refs.append((t,c))
+                    report.append(audit_row(source_file=source_file,table=t,field=c,action='reference_field_safe',risk_level='info',reason='字段在 known_reference_fields 白名单中，允许作为引用字段更新',planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='N',safe='Y'))
         if not report:
             report.append(audit_row(source_file=source_file,action='reference_fields_none',risk_level='info',reason='未识别到会更新的引用表字段',planned_sql_type='NONE',dry_run=yn(dry),blocked_commit='N',safe='Y'))
         return refs,report
@@ -576,6 +608,7 @@ class AccessDB:
                     old=sql_value(r.get('old_code','')); new=sql_value(r.get('new_code','')); parent=sql_value(r.get('new_parent_code','')); action=sql_value(r.get('action','')).lower()
                     if old and old not in accounts: self.add_preflight(pre,r,'old_code_missing','error','old_code 在账套科目表中不存在',dry)
                     if new and new in accounts and old!=new and action not in MERGE_ACTIONS: self.add_preflight(pre,r,'new_code_exists_without_merge_action','error','new_code 已存在，但 action 不是明确合并策略',dry)
+                    if new and new in accounts and old!=new and action in MERGE_ACTIONS: self.add_preflight(pre,r,'merge_requires_usage_check','error','多个旧科目映射到同一个已存在新科目时，需要先校验余额/凭证是否要合并；当前不会静默 UPDATE',dry)
                     if parent and parent not in final_codes: self.add_preflight(pre,r,'new_parent_missing','error','new_parent_code 在最终科目集合中不存在',dry)
                     if parent and new and not new.startswith(parent): self.add_preflight(pre,r,'parent_prefix_mismatch','error','new_code 不是 new_parent_code 的下级前缀',dry)
                     if new and len(lengths)<=max_levels:
@@ -710,17 +743,25 @@ def cmd_scan_kis(a):
             pa=getattr(e,'audit',[])
             if pa: perf+=pa
             errs.append({'ledger_file':str(f),'stage':'connect_or_scan','error':str(e)})
-    maps,std,ex=build_plan(accounts,cfg) if accounts else ([],[],[])
-    account_cols=['ledger_file','ledger_name','year','company_name','start_year','current_year','start_period','current_period','natural_start_year','voucher_start_date','voucher_end_date','voucher_min_year','voucher_max_year','voucher_min_period','voucher_max_period','FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6','account_table','account_code_field','account_name_field','old_code','old_name','old_full_name','old_parent_code','used_in_voucher','used_in_balance','voucher_usage_checked','balance_usage_checked']
-    aux_cols=['ledger_file','ledger_name','year','company_name','source_table','item_code','item_name','item_type','account_code']
+    maps=[]; std=[]; ex=[]
+    if accounts:
+        grouped=defaultdict(list)
+        for arow in accounts: grouped[sql_value(arow.get('ledger_group')) or '未命名账套组'].append(arow)
+        for group,items in grouped.items():
+            gm,gs,ge=build_plan(items,cfg)
+            maps+=gm
+            std+=[{'ledger_group':group,**x} for x in gs]
+            ex+=[{'ledger_group':group,**x} for x in ge]
+    account_cols=['ledger_group','ledger_file','ledger_name','year','company_name','start_year','current_year','start_period','current_period','natural_start_year','voucher_start_date','voucher_end_date','voucher_min_year','voucher_max_year','voucher_min_period','voucher_max_period','FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6','account_table','account_code_field','account_name_field','old_code','old_name','old_full_name','old_parent_code','used_in_voucher','used_in_balance','voucher_usage_checked','balance_usage_checked']
+    aux_cols=['ledger_group','ledger_file','ledger_name','year','company_name','source_table','item_code','item_name','item_type','account_code']
     err_cols=['ledger_file','stage','error']
     perf_cols=['ledger_file','ledger_name','scan_mode','connected','status','elapsed_ms','account_rows','auxiliary_rows','touched_tables','full_table_scan','full_field_scan','refs_called','write_sql','error']
-    map_cols=['ledger_file','ledger_name','year','old_code','old_name','old_full_name','old_parent_code','used_in_voucher','used_in_balance','new_code','new_name','new_parent_code','action','conflict_type','reason','confirmed']
+    map_cols=['ledger_group','ledger_file','ledger_name','year','old_code','old_name','old_full_name','old_parent_code','used_in_voucher','used_in_balance','new_code','new_name','new_parent_code','action','conflict_type','reason','confirmed']
     write_csv_columns(out/'kis_accounts_summary.csv',accounts,account_cols)
     write_csv_columns(out/'kis_auxiliary_items.csv',aux,aux_cols)
     write_csv_columns(out/'kis_scan_errors.csv',errs,err_cols)
     write_csv_columns(out/'kis_scan_performance.csv',perf,perf_cols)
-    write_csv_columns(out/'standard_accounts_draft.csv',std,['科目编码','科目名称','上级科目编码'])
+    write_csv_columns(out/'standard_accounts_draft.csv',std,['ledger_group','科目编码','科目名称','上级科目编码'])
     write_csv_columns(out/'mapping_draft.csv',maps,map_cols)
     if ex: write_csv(out/'kis_scan_conflicts.csv',ex)
     print('完成，输出目录：',out)
@@ -731,8 +772,9 @@ def cmd_apply(a):
         src=sql_value(r.get('ledger_file','')); all_by[src].append(r)
         if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         by[src].append(r)
+    dst_by=ledger_output_paths(out,[s for s in all_by.keys() if s])
     for src,all_rows in all_by.items():
-        dst=str(out/Path(src).name) if src else ''
+        dst=dst_by.get(src,'') if src else ''
         pf,rr=db.preflight_apply(src,dst,by.get(src,[]),all_rows,a.dry_run); preflight+=pf; ref_report+=rr
     write_csv(out/'preflight_report.csv',preflight); write_csv(out/'reference_fields_report.csv',ref_report)
     blocked=[r for r in preflight+ref_report if is_blocking(r)]
@@ -745,7 +787,7 @@ def cmd_apply(a):
     for src,maps in by.items():
         if not src: continue
         print(('试运行 ' if a.dry_run else '写入副本 ')+src)
-        try: audit+=db.apply(src,str(out/Path(src).name),maps,a.dry_run)
+        try: audit+=db.apply(src,dst_by.get(src,str(out/Path(src).name)),maps,a.dry_run)
         except Exception as e:
             audit+=getattr(e,'audit',[])
             audit.append(audit_row(source_file=src,action='apply_error',risk_level='error',reason=str(e),planned_sql_type='APPLY',dry_run=yn(a.dry_run),blocked_commit='Y',file=src,error=str(e)))
