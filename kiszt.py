@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse, csv, json, os, re, shutil, tempfile, platform, sys, time, hashlib
 from pathlib import Path
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 
 LEDGER_SUFFIXES={'.ais','.aiy','.axx','.mdb'}
 DEFAULT_CONFIG={
@@ -91,6 +92,10 @@ def ledger_output_paths(out,sources,source_years=None):
     return result
 
 RESULT_SUMMARY_COLS=['原始账套路径','修改后账套路径','账套文件ID','公司名称','年度','是否生成副本','是否执行修改','修改科目数量','修改表数量','审计文件路径','处理状态','失败原因']
+EXPORT_CHANGED_COLS=['账套组','账套文件','账套文件ID','公司名称','年度','旧科目编码','旧科目名称','新科目编码','新科目名称','处理动作','是否确认','原因']
+EXPORT_SUMMARY_COLS=['账套组','账套文件','账套文件ID','公司名称','年度','期间','新科目编码','新科目名称','核算项目类别','核算项目编码','核算项目名称','借方合计','贷方合计','净额','分录数量']
+EXPORT_CHECK_COLS=['账套文件','账套文件ID','公司名称','年度','凭证分录数量','借方合计','贷方合计','借贷是否平衡','已映射分录数量','未映射分录数量','修改科目数量','导出状态','错误原因']
+EXPORT_ERROR_COLS=['账套文件','账套文件ID','公司名称','年度','级别','阶段','错误原因']
 
 def abs_path_text(path):
     if not path: return ''
@@ -144,6 +149,11 @@ def write_csv_columns(path,rows,columns):
 
 def read_csv(path):
     with open(path,'r',encoding='utf-8-sig',newline='') as f: return list(csv.DictReader(f))
+
+def read_csv_with_fields(path):
+    with open(path,'r',encoding='utf-8-sig',newline='') as f:
+        reader=csv.DictReader(f)
+        return reader.fieldnames or [],list(reader)
 
 def app_dir():
     if getattr(sys,'frozen',False): return Path(sys.executable).resolve().parent
@@ -239,6 +249,16 @@ def ledger_header_hint(file_path,systemdb):
 def sql_value(v):
     if v is None: return ''
     return str(v).strip()
+
+def money_value(v):
+    s=sql_value(v).replace(',','')
+    if not s: return Decimal('0')
+    try: return Decimal(s)
+    except (InvalidOperation,ValueError): return Decimal('0')
+
+def money_text(v):
+    try: return format(Decimal(v).quantize(Decimal('0.01')),'f')
+    except Exception: return '0.00'
 
 def year_from_value(v):
     m=re.search(r'(?:19|20)\d{2}',sql_value(v))
@@ -389,6 +409,23 @@ def normalize_mapping_row(r):
     if out.get('source_file') and not out.get('source_file_id'): out['source_file_id']=source_file_id(out['source_file'])
     if out.get('new_code') and not out.get('new_parent_code'): out['new_parent_code']=row_value(r,'old_parent_code','父级编码')
     return out
+
+def confirmed_mapping(row):
+    return row_value(row,'confirmed','是否确认').upper()=='Y'
+
+def changed_mapping(row):
+    old=row_value(row,'old_code','旧科目编码','原始科目编码')
+    new=row_value(row,'new_code','新科目编码','自动生成新编码')
+    return bool(old and new and old!=new)
+
+def mapping_source_matches(row,src,fid,year):
+    rid=row_value(row,'source_file_id','账套文件ID')
+    ryear=row_value(row,'year','年度')
+    rsrc=row_value(row,'source_file','ledger_file','账套文件')
+    if rid and rid!=fid: return False
+    if not rid and rsrc and Path(rsrc).name.lower()!=Path(src).name.lower(): return False
+    if ryear and year and ryear!=year: return False
+    return bool(rid or rsrc or not row_value(row,'source_file','ledger_file','账套文件'))
 
 def pref_lengths_from_row(row):
     raw=pref_raw_lengths_from_row(row)
@@ -718,6 +755,117 @@ class AccessDB:
         finally:
             conn.close()
             shutil.rmtree(read_tmp,ignore_errors=True)
+    def auxiliary_lookup(self,conn):
+        lookup={}; cls={}
+        if self.fast_table_exists(conn,'GLCls'):
+            rows,_=self.fast_rows_known(conn,'GLCls',['FClsID','FClassID','FNumber','FCode','FName','FClsName','FClassName','FType'])
+            for r in rows:
+                code=self.first_of(r,['FClsID','FClassID','FNumber','FCode','FType'])
+                name=self.first_of(r,['FName','FClsName','FClassName'])
+                if code: cls[code]=name or code
+        specs={
+            'GLObj':['FObjID','FObjectID','FNumber','FCode','FName','FObjName','FItemName','FClassID','FType','FGroupID'],
+            'GLEmp':['FEmpID','FEmpCode','FNumber','FCode','FName','FEmpName','FDeptID','FGroupID'],
+            'PAData':['FDataID','FItemID','FNumber','FCode','FAcctID','FName','FDataName','FItemName','FClassID','FType'],
+            'PAItem':['FItemID','FNumber','FCode','FAcctID','FName','FItemName','FClassID','FType'],
+        }
+        code_cands=['FObjID','FObjectID','FEmpID','FEmpCode','FDataID','FItemID','FNumber','FCode']
+        name_cands=['FName','FObjName','FEmpName','FDataName','FItemName']
+        type_cands=['FClassID','FType','FGroupID','FDeptID']
+        for table,cands in specs.items():
+            if not self.fast_table_exists(conn,table): continue
+            try:
+                rows,_=self.fast_rows_known(conn,table,cands)
+                for r in rows:
+                    code=self.first_of(r,code_cands); name=self.first_of(r,name_cands); typ=self.first_of(r,type_cands)
+                    if not code: continue
+                    typ_name=cls.get(typ,typ)
+                    lookup[(typ,code)]={'type':typ_name,'code':code,'name':name}
+                    lookup[('',code)]={'type':typ_name,'code':code,'name':name}
+            except Exception:
+                pass
+        return lookup
+    def voucher_amounts(self,row,debit_field,credit_field,amount_field,dc_field):
+        if debit_field or credit_field:
+            return money_value(row.get(debit_field,'')),money_value(row.get(credit_field,''))
+        amount=money_value(row.get(amount_field,''))
+        dc=row_value(row,dc_field).upper()
+        if dc in ('D','DR','J','借','1','借方'):
+            return amount,Decimal('0')
+        if dc in ('C','CR','贷','-1','2','贷方'):
+            return Decimal('0'),amount
+        if amount>=0: return amount,Decimal('0')
+        return Decimal('0'),-amount
+    def export_vouchers_file(self,file,mapping_rows,index=1,total=1):
+        conn=None; read_tmp=None; summaries={}; changed=[]; errors=[]; check={}
+        fid=source_file_id(file)
+        try:
+            read_path,read_tmp=self.read_copy_path(str(file)); conn=self.connect(read_path,str(file))
+            info=self.ledger_info(conn,file); year=row_value(info,'year') or year_of(file); company=row_value(info,'company','company_name','公司名称')
+            group=ledger_group_name(file,company)
+            print('正在读取第 %s/%s 个账套：%s'%(index,total,file))
+            print('年度：%s'%year)
+            table,f=self.account_table(conn); cf,nf=f['code'],f['name']; accounts=self.account_map(conn,table,cf,nf)
+            relevant=[r for r in mapping_rows if mapping_source_matches(r,str(file),fid,year)]
+            change_rows=[r for r in relevant if confirmed_mapping(r) and changed_mapping(r)]
+            change_map={}
+            for r in change_rows:
+                old=row_value(r,'old_code'); new=row_value(r,'new_code'); new_name=row_value(r,'new_name') or row_value(r,'old_name')
+                change_map[old]={'new_code':new,'new_name':new_name,'row':r}
+                changed.append({'账套组':group,'账套文件':str(file),'账套文件ID':fid,'公司名称':company,'年度':year,'旧科目编码':old,'旧科目名称':row_value(r,'old_name'),'新科目编码':new,'新科目名称':new_name,'处理动作':row_value(r,'action'),'是否确认':row_value(r,'confirmed'),'原因':row_value(r,'reason')})
+            print('修改科目数量：%s'%len(change_map))
+            if not self.fast_table_exists(conn,'GLVch'):
+                raise RuntimeError('GLVch 不存在，无法导出凭证汇总')
+            acct_field=self.fast_pick_field(conn,'GLVch',['FAcctID','FAccountID','FAcctCode','FAcctNo','FCode'])
+            if not acct_field: raise RuntimeError('GLVch 无法识别科目字段')
+            period_field=self.fast_pick_field(conn,'GLVch',['FPeriod','FPeriodID','FPerd','FPrd','FMonth'])
+            debit_field=self.fast_pick_field(conn,'GLVch',['FDebit','FDebitAmount','FDebitFor','FDr','FJf'])
+            credit_field=self.fast_pick_field(conn,'GLVch',['FCredit','FCreditAmount','FCreditFor','FCr','FDf'])
+            amount_field=self.fast_pick_field(conn,'GLVch',['FAmount','FMoney','FValue','FAmountFor'])
+            dc_field=self.fast_pick_field(conn,'GLVch',['FDC','FDirection','FDir','FEntryDC'])
+            aux_code_field=self.fast_pick_field(conn,'GLVch',['FObjID','FObjectID','FItemID','FItemDetailID','FAuxID','FEmpID','FCustomerID','FSupplierID'])
+            aux_type_field=self.fast_pick_field(conn,'GLVch',['FClassID','FItemClassID','FObjType','FType','FGroupID'])
+            if not (debit_field or credit_field or amount_field):
+                raise RuntimeError('GLVch 无法识别借贷金额字段')
+            fields=[x for x in [period_field,acct_field,debit_field,credit_field,amount_field,dc_field,aux_type_field,aux_code_field] if x]
+            seen=[]; fields=[x for x in fields if not (x in seen or seen.append(x))]
+            aux_lookup=self.auxiliary_lookup(conn) if aux_code_field else {}
+            cur=conn.cursor(); cur.execute('SELECT '+','.join('[%s]'%x for x in fields)+' FROM [GLVch]')
+            entries=0; mapped_entries=0; total_debit=Decimal('0'); total_credit=Decimal('0')
+            for rec in cur:
+                row={fields[i]:rec[i] for i in range(len(fields))}
+                old_code=sql_value(row.get(acct_field,''))
+                if not old_code: continue
+                entries+=1
+                mapped=change_map.get(old_code)
+                if mapped:
+                    mapped_entries+=1; new_code=mapped['new_code']; new_name=mapped['new_name']
+                else:
+                    new_code=old_code; new_name=accounts.get(old_code,'')
+                debit,credit=self.voucher_amounts(row,debit_field,credit_field,amount_field,dc_field)
+                total_debit+=debit; total_credit+=credit
+                aux_code=sql_value(row.get(aux_code_field,'')) if aux_code_field else ''
+                aux_type=sql_value(row.get(aux_type_field,'')) if aux_type_field else ''
+                aux=aux_lookup.get((aux_type,aux_code)) or aux_lookup.get(('',aux_code)) or {'type':aux_type,'code':aux_code,'name':''}
+                key=(group,str(file),fid,company,year,sql_value(row.get(period_field,'')) if period_field else '',new_code,new_name,aux.get('type',''),aux.get('code',''),aux.get('name',''))
+                item=summaries.setdefault(key,{'借方合计':Decimal('0'),'贷方合计':Decimal('0'),'分录数量':0})
+                item['借方合计']+=debit; item['贷方合计']+=credit; item['分录数量']+=1
+            balanced=abs(total_debit-total_credit)<=Decimal('0.01')
+            print('凭证分录数量：%s'%entries)
+            print('借贷是否平衡：%s'%('Y' if balanced else 'N'))
+            check={'账套文件':str(file),'账套文件ID':fid,'公司名称':company,'年度':year,'凭证分录数量':entries,'借方合计':money_text(total_debit),'贷方合计':money_text(total_credit),'借贷是否平衡':yn(balanced),'已映射分录数量':mapped_entries,'未映射分录数量':entries-mapped_entries,'修改科目数量':len(change_map),'导出状态':'成功','错误原因':''}
+        except Exception as e:
+            errors.append({'账套文件':str(file),'账套文件ID':fid,'公司名称':'','年度':year_of(file),'级别':'error','阶段':'export-vouchers','错误原因':str(e)})
+            check={'账套文件':str(file),'账套文件ID':fid,'公司名称':'','年度':year_of(file),'凭证分录数量':0,'借方合计':'0.00','贷方合计':'0.00','借贷是否平衡':'N','已映射分录数量':0,'未映射分录数量':0,'修改科目数量':0,'导出状态':'失败','错误原因':str(e)}
+            print('错误信息：%s'%e)
+        finally:
+            if conn: conn.close()
+            if read_tmp: shutil.rmtree(read_tmp,ignore_errors=True)
+        rows=[]
+        for key,val in summaries.items():
+            debit=val['借方合计']; credit=val['贷方合计']
+            rows.append({'账套组':key[0],'账套文件':key[1],'账套文件ID':key[2],'公司名称':key[3],'年度':key[4],'期间':key[5],'新科目编码':key[6],'新科目名称':key[7],'核算项目类别':key[8],'核算项目编码':key[9],'核算项目名称':key[10],'借方合计':money_text(debit),'贷方合计':money_text(credit),'净额':money_text(debit-credit),'分录数量':val['分录数量']})
+        return changed,rows,check,errors
     def reference_fields(self,conn,account_table='',account_code_field='',source_file='',dry=True):
         refs=[]; report=[]; known=self.cfg.get('known_reference_fields',{})
         for t,fields in known.items():
@@ -1288,6 +1436,45 @@ def cmd_apply(a):
         print('完成（部分失败）。')
         if not a.dry_run: raise SystemExit(1)
     print('完成。')
+
+def cmd_export_vouchers(a):
+    cfg=load_config_for_args(a); db=AccessDB(cfg); out=Path(a.out); out.mkdir(parents=True,exist_ok=True)
+    fields,raw_rows=read_csv_with_fields(a.mapping)
+    if not any(x in fields for x in ['confirmed','是否确认']):
+        raise SystemExit('映射表必须包含 confirmed 或 是否确认 列：%s'%a.mapping)
+    maps=[normalize_mapping_row(r) for r in raw_rows]
+    confirmed_changes=[r for r in maps if confirmed_mapping(r) and changed_mapping(r)]
+    all_changed=[]; all_summary=[]; checks=[]; errors=[]
+    if not confirmed_changes:
+        msg='没有确认的科目修改，将按原科目编码汇总凭证。'
+        print(msg)
+        errors.append({'账套文件':'','账套文件ID':'','公司名称':'','年度':'','级别':'warning','阶段':'mapping','错误原因':msg})
+    files=ledgers(a.input)
+    total=len(files)
+    for i,file in enumerate(files,1):
+        changed,summary,check,errs=db.export_vouchers_file(str(file),maps,i,total)
+        all_changed+=changed; all_summary+=summary; checks.append(check); errors+=errs
+    all_changed=sorted(all_changed,key=lambda r:(row_value(r,'账套组'),row_value(r,'年度'),row_value(r,'旧科目编码'),row_value(r,'账套文件')))
+    all_summary=sorted(all_summary,key=lambda r:(row_value(r,'账套组'),row_value(r,'年度'),row_value(r,'期间'),row_value(r,'新科目编码'),row_value(r,'核算项目编码')))
+    changed_file=out/'01_修改科目清单.csv'
+    summary_file=out/'02_凭证汇总_按新科目.csv'
+    check_file=out/'03_导出检查报告.csv'
+    error_file=out/'04_导出错误报告.csv'
+    write_csv_columns(changed_file,all_changed,EXPORT_CHANGED_COLS)
+    write_csv_columns(summary_file,all_summary,EXPORT_SUMMARY_COLS)
+    write_csv_columns(check_file,checks,EXPORT_CHECK_COLS)
+    if errors:
+        write_csv_columns(error_file,errors,EXPORT_ERROR_COLS)
+    elif error_file.exists():
+        try: error_file.unlink()
+        except Exception: pass
+    print('导出完成')
+    print('输出目录路径：%s'%abs_path_text(out))
+    print('修改科目清单路径：%s'%abs_path_text(changed_file))
+    print('凭证汇总路径：%s'%abs_path_text(summary_file))
+    print('检查报告路径：%s'%abs_path_text(check_file))
+    if errors: print('错误报告路径：%s'%abs_path_text(error_file))
+
 def _is_frozen():
     return getattr(sys,'frozen',False)
 
@@ -1338,6 +1525,21 @@ def _launch_gui():
         for w in (f,circ,lbl): w.bind('<Button-1>',on_click)
         step_btns.append((f,circ,lbl))
     for i,(long,short) in enumerate(STEPS): make_step_btn(i,long)
+    tk.Frame(sidebar,bg=BORDER,height=1).pack(fill='x',padx=12,pady=10)
+    tk.Button(
+        sidebar,
+        text='老账套凭证汇总导出',
+        command=lambda: render_export(),
+        font=FNT,
+        bg=WHITE,
+        fg=BLUE,
+        relief='solid',
+        bd=1,
+        padx=8,
+        pady=6,
+        cursor='hand2',
+        wraplength=130,
+    ).pack(fill='x',padx=10,pady=(0,8))
 
     def refresh_sidebar():
         s=cur_step.get()
@@ -1375,6 +1577,7 @@ def _launch_gui():
     # ── 输入变量 ──────────────────────────────────────────────
     v_src=tk.StringVar(); v_work=tk.StringVar(); v_map=tk.StringVar()
     v_out=tk.StringVar(); v_mode=tk.StringVar(value='dryrun')
+    v_export_src=tk.StringVar(); v_export_map=tk.StringVar(); v_export_out=tk.StringVar()
     log_widget=None
 
     # ── 页面渲染 ──────────────────────────────────────────────
@@ -1583,8 +1786,97 @@ def _launch_gui():
                 _run_in_thread(run)
             btn_next.config(text='确认写入 ▶',command=do_commit,bg='#3B6D11',activebackground='#27500A')
 
-        btn_prev.config(state='normal' if s>0 else 'disabled')
+        btn_prev.config(state='normal' if s>0 else 'disabled',command=lambda:go_step(cur_step.get()-1))
         refresh_sidebar()
+        canvas.yview_moveto(0)
+
+    def validate_export_mapping_file(path):
+        try:
+            with open(path,'r',encoding='utf-8-sig',newline='') as f:
+                reader=csv.DictReader(f)
+                fields=reader.fieldnames or []
+                if 'confirmed' not in fields and '是否确认' not in fields:
+                    messagebox.showwarning('映射表缺少确认列','映射表必须包含 confirmed 或 是否确认 列。')
+                    return False
+                confirmed_changes=0
+                for row in reader:
+                    confirmed=(row.get('confirmed') or row.get('是否确认') or '').strip().upper()=='Y'
+                    old=(row.get('old_code') or row.get('旧科目编码') or row.get('原始科目编码') or '').strip()
+                    new=(row.get('new_code') or row.get('新科目编码') or row.get('自动生成新编码') or '').strip()
+                    if confirmed and old and new and old!=new:
+                        confirmed_changes+=1
+                if confirmed_changes==0:
+                    messagebox.showinfo('没有确认的科目修改','没有确认的科目修改，将按原科目编码汇总凭证。')
+                return True
+        except Exception as e:
+            messagebox.showerror('读取映射表失败',str(e))
+            return False
+
+    def render_export():
+        nonlocal log_widget
+        cur_step.set(-1)
+        clear_inner(); refresh_sidebar(); prog_fill.place(relwidth=1)
+        tag_f=tk.Frame(inner,bg=WHITE); tag_f.pack(fill='x',padx=24,pady=(20,4))
+        tk.Label(tag_f,text='独立功能',bg='#E6F1FB',fg='#185FA5',font=FNT_S,padx=10,pady=3,relief='flat').pack(side='left')
+        lbl(inner,'老账套凭证汇总导出',13,True,pady=4)
+        lbl(inner,'适用于太老的 AIS 账套：不修改账套文件，只按科目映射导出凭证汇总，供后续人工导入。',color=MUTED,wrap=600)
+        sep(inner)
+        entry_row(inner,'老账套目录',v_export_src,browse_dir=True)
+        entry_row(inner,'科目映射确认表',v_export_map,browse_file=True)
+        entry_row(inner,'导出输出目录',v_export_out,browse_dir=True)
+        info_box(inner,'本功能只读 AIS，不复制后修改账套，也不会调用 apply。输出：01_修改科目清单.csv、02_凭证汇总_按新科目.csv、03_导出检查报告.csv。','info')
+        sep(inner)
+        log_f=tk.Frame(inner,bg=WHITE); log_f.pack(fill='x',padx=24)
+        log_widget=scrolledtext.ScrolledText(log_f,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=9,state='disabled',wrap='word',relief='flat',bd=0)
+        log_widget.pack(fill='x')
+
+        def do_export():
+            if not v_export_src.get() or not v_export_map.get() or not v_export_out.get():
+                messagebox.showwarning('缺少路径','请填写老账套目录、科目映射确认表和导出输出目录。'); return
+            if not Path(v_export_map.get()).exists():
+                messagebox.showwarning('映射表不存在',v_export_map.get()); return
+            if not validate_export_mapping_file(v_export_map.get()):
+                return
+            btn_next.config(state='disabled',text='导出中...')
+            log_widget.config(state='normal'); log_widget.delete('1.0','end'); log_widget.config(state='disabled')
+
+            def append_log(text):
+                if not text: return
+                log_widget.config(state='normal')
+                log_widget.insert('end',text)
+                log_widget.see('end')
+                log_widget.config(state='disabled')
+
+            class LiveLog:
+                def write(self,text):
+                    if text: root.after(0,append_log,text)
+                def flush(self): pass
+
+            def run():
+                sys.argv=['','export-vouchers','--input',v_export_src.get(),'--mapping',v_export_map.get(),'--out',v_export_out.get()]
+                old_out=sys.stdout; old_err=sys.stderr; ok=True; reason=''
+                try:
+                    live=LiveLog(); sys.stdout=live; sys.stderr=live
+                    main()
+                except SystemExit as e:
+                    ok=not e.code; reason='返回码：%s'%e.code if e.code else ''
+                except Exception as ex:
+                    ok=False; reason=str(ex)
+                    print('错误：'+reason)
+                finally:
+                    sys.stdout=old_out; sys.stderr=old_err
+                def done():
+                    btn_next.config(state='normal',text='导出凭证汇总',command=do_export)
+                    out=Path(v_export_out.get())
+                    if ok:
+                        messagebox.showinfo('导出完成','导出完成\n输出目录路径：%s\n修改科目清单路径：%s\n凭证汇总路径：%s\n检查报告路径：%s'%(out,out/'01_修改科目清单.csv',out/'02_凭证汇总_按新科目.csv',out/'03_导出检查报告.csv'))
+                    else:
+                        messagebox.showerror('导出失败','导出失败：%s\n请查看错误报告：%s'%(reason,out/'04_导出错误报告.csv'))
+                root.after(0,done)
+            _run_in_thread(run)
+
+        btn_prev.config(state='normal',command=lambda:go_step(0))
+        btn_next.config(state='normal',text='导出凭证汇总',command=do_export,bg=BLUE,activebackground=BLUE_H)
         canvas.yview_moveto(0)
 
     def go_step(s):
@@ -1628,6 +1920,7 @@ def main():
     q=sub.add_parser('inspect'); q.add_argument('--input',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.set_defaults(func=cmd_inspect)
     q=sub.add_parser('scan-kis'); q.add_argument('--input',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.set_defaults(func=cmd_scan_kis)
     q=sub.add_parser('apply'); q.add_argument('--mapping',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.add_argument('--dry-run',action='store_true',default=True); q.add_argument('--commit',dest='dry_run',action='store_false'); q.add_argument('--allow-unconfirmed',action='store_true'); q.set_defaults(func=cmd_apply)
+    q=sub.add_parser('export-vouchers'); q.add_argument('--input',required=True); q.add_argument('--mapping',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.set_defaults(func=cmd_export_vouchers)
     a=p.parse_args(); a.func(a)
 
 if __name__=='__main__':

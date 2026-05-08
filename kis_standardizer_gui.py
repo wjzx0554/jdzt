@@ -42,6 +42,9 @@ class App(tk.Tk):
         self.output_dir = tk.StringVar()
         self.config_file = tk.StringVar()
         self.mapping_file = tk.StringVar()
+        self.export_input_dir = tk.StringVar()
+        self.export_mapping_file = tk.StringVar()
+        self.export_output_dir = tk.StringVar()
         self.allow_unconfirmed = tk.BooleanVar(value=False)
         self.status_text = tk.StringVar(value='请选择原始账套目录，然后执行快速扫描。')
         self.buttons = []
@@ -91,6 +94,18 @@ class App(tk.Tk):
         self.add_button(tools, '打开处理结果目录', self.open_output_dir).pack(side=tk.RIGHT, padx=(8, 0))
         self.add_button(tools, '旧版全量分析', self.inspect).pack(side=tk.RIGHT, padx=(8, 0))
 
+        export_box = ttk.LabelFrame(root, text='老账套凭证汇总导出', padding=10)
+        export_box.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(
+            export_box,
+            text='适用于太老的 AIS 账套：不修改账套文件，只按科目映射导出凭证汇总，供后续人工导入。',
+            wraplength=1080,
+        ).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 6))
+        self.row(export_box, 1, '老账套目录', self.export_input_dir, 'dir')
+        self.row(export_box, 2, '科目映射确认表', self.export_mapping_file, 'file')
+        self.row(export_box, 3, '导出输出目录', self.export_output_dir, 'dir')
+        self.add_button(export_box, '导出凭证汇总', self.export_vouchers).grid(row=4, column=2, sticky='e', pady=(8, 0))
+
         body = ttk.PanedWindow(root, orient=tk.VERTICAL)
         body.pack(fill=tk.BOTH, expand=True)
 
@@ -111,6 +126,10 @@ class App(tk.Tk):
             '处理结果',
             '试运行审计',
             '正式审计',
+            '修改科目清单',
+            '凭证汇总',
+            '导出检查',
+            '导出错误',
         ]:
             self.add_preview_tab(title)
 
@@ -192,14 +211,14 @@ class App(tk.Tk):
         for btn in self.buttons:
             btn.configure(state=state)
 
-    def run_core(self, argv, done='完成。', on_success=None):
+    def run_core(self, argv, done='完成。', on_success=None, on_failure=None):
         if self.busy:
             messagebox.showinfo('正在运行', '当前任务还没有结束，请稍等。')
             return
 
         def task():
             old = sys.argv[:]
-            result = {'ok': True}
+            result = {'ok': True, 'message': ''}
             self.log_queue.put('\n>>> ' + ' '.join(argv) + '\n')
             try:
                 sys.argv = argv[:]
@@ -209,10 +228,12 @@ class App(tk.Tk):
             except SystemExit as e:
                 if e.code not in (0, None):
                     result['ok'] = False
-                    self.log_queue.put('运行结束，返回码：%s\n' % e.code)
+                    result['message'] = '运行结束，返回码：%s' % e.code
+                    self.log_queue.put(result['message'] + '\n')
             except Exception:
                 result['ok'] = False
-                self.log_queue.put('\n发生错误：\n' + traceback.format_exc())
+                result['message'] = traceback.format_exc()
+                self.log_queue.put('\n发生错误：\n' + result['message'])
             finally:
                 sys.argv = old
 
@@ -222,6 +243,8 @@ class App(tk.Tk):
                     self.log_queue.put(done + '\n')
                     if on_success:
                         on_success()
+                elif on_failure:
+                    on_failure(result.get('message') or '运行失败。')
 
             self.after(0, finish)
 
@@ -331,6 +354,71 @@ class App(tk.Tk):
 
         self.run_core(argv, '正式处理完成。', done)
 
+    def validate_export_mapping(self, path):
+        try:
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+                reader = csv.DictReader(f)
+                fields = reader.fieldnames or []
+                if 'confirmed' not in fields and '是否确认' not in fields:
+                    messagebox.showwarning('映射表缺少确认列', '映射表必须包含 confirmed 或 是否确认 列。')
+                    return False
+                confirmed_changes = 0
+                for row in reader:
+                    confirmed = (row.get('confirmed') or row.get('是否确认') or '').strip().upper() == 'Y'
+                    old = (row.get('old_code') or row.get('旧科目编码') or row.get('原始科目编码') or '').strip()
+                    new = (row.get('new_code') or row.get('新科目编码') or row.get('自动生成新编码') or '').strip()
+                    if confirmed and old and new and old != new:
+                        confirmed_changes += 1
+                if confirmed_changes == 0:
+                    messagebox.showinfo('没有确认的科目修改', '没有确认的科目修改，将按原科目编码汇总凭证。')
+                return True
+        except Exception as e:
+            messagebox.showerror('读取映射表失败', str(e))
+            return False
+
+    def export_vouchers(self):
+        if not self.require(('老账套目录', self.export_input_dir), ('科目映射确认表', self.export_mapping_file), ('导出输出目录', self.export_output_dir)):
+            return
+        mapping = Path(self.export_mapping_file.get())
+        if not mapping.exists():
+            messagebox.showwarning('映射表不存在', str(mapping))
+            return
+        if not self.validate_export_mapping(mapping):
+            return
+        argv = [
+            'kis_multi_year_account_standardizer.py',
+            'export-vouchers',
+            '--input',
+            self.export_input_dir.get(),
+            '--mapping',
+            self.export_mapping_file.get(),
+            '--out',
+            self.export_output_dir.get(),
+        ]
+        if self.config_file.get().strip():
+            argv += ['--config', self.config_file.get()]
+
+        def done():
+            out = Path(self.export_output_dir.get())
+            self.status_text.set('老账套凭证汇总导出完成。请查看“修改科目清单”“凭证汇总”“导出检查”。')
+            self.refresh_previews()
+            messagebox.showinfo(
+                '导出完成',
+                '导出完成\n输出目录路径：%s\n修改科目清单路径：%s\n凭证汇总路径：%s\n检查报告路径：%s'
+                % (
+                    out,
+                    out / '01_修改科目清单.csv',
+                    out / '02_凭证汇总_按新科目.csv',
+                    out / '03_导出检查报告.csv',
+                ),
+            )
+
+        def failed(reason):
+            out = Path(self.export_output_dir.get())
+            messagebox.showerror('导出失败', '导出失败：%s\n请查看错误报告：%s' % (reason, out / '04_导出错误报告.csv'))
+
+        self.run_core(argv, '凭证汇总导出完成。', done, failed)
+
     def preview_path(self, title):
         work = Path(self.work_dir.get()) if self.work_dir.get().strip() else None
         out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
@@ -347,6 +435,10 @@ class App(tk.Tk):
             '处理结果': out / '00_处理结果汇总.csv' if out else None,
             '试运行审计': out / '09_账套修改审计.csv' if out else None,
             '正式审计': out / '09_账套修改审计.csv' if out else None,
+            '修改科目清单': Path(self.export_output_dir.get()) / '01_修改科目清单.csv' if self.export_output_dir.get().strip() else None,
+            '凭证汇总': Path(self.export_output_dir.get()) / '02_凭证汇总_按新科目.csv' if self.export_output_dir.get().strip() else None,
+            '导出检查': Path(self.export_output_dir.get()) / '03_导出检查报告.csv' if self.export_output_dir.get().strip() else None,
+            '导出错误': Path(self.export_output_dir.get()) / '04_导出错误报告.csv' if self.export_output_dir.get().strip() else None,
         }
         return files.get(title)
 
