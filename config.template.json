@@ -12,7 +12,7 @@
     "GLBalHist": ["FAcctID"],
     "GLInitBal": ["FAcctID"],
     "GLInitData": ["FAcctID"],
-    "GLPref": ["FProfitAcctID", "FLossAcctID", "FYearProfitAcctID", "FYearLossAcctID", "FExchangeGainAcctID", "FExchangeLossAcctID", "FCashAcctID", "FBankAcctID", "FTaxAcctID", "FDefaultAcctID", "FPLAcctID", "FDefAcctID"]
+    "GLPref": ["FCashAc", "FBankAc", "FExchAc", "FEarnAc", "FAssetAc", "FDeprAc", "FProfitAcctID", "FLossAcctID", "FYearProfitAcctID", "FYearLossAcctID", "FExchangeGainAcctID", "FExchangeLossAcctID", "FCashAcctID", "FBankAcctID", "FTaxAcctID", "FDefaultAcctID", "FPLAcctID", "FDefAcctID"]
   },
   "auto_reference_field_names": ["FAcctID", "FNumber", "FCode", "AcctCode", "AccountCode"],
   "voucher_reference_tables": ["GLVch", "GLVchEntry"],

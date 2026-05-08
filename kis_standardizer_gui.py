@@ -250,7 +250,7 @@ class App(tk.Tk):
             argv += ['--config', self.config_file.get()]
 
         def done():
-            mapping = Path(self.work_dir.get()) / 'mapping_draft.csv'
+            mapping = Path(self.work_dir.get()) / '04_科目映射确认表.csv'
             self.mapping_file.set(str(mapping))
             self.status_text.set('快速扫描完成。请先查看“映射草稿”和“扫描错误”，必要时打开映射 CSV 修改确认列。')
             self.refresh_previews()
@@ -335,16 +335,16 @@ class App(tk.Tk):
         out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
         mapping = Path(self.mapping_file.get()) if self.mapping_file.get().strip() else None
         files = {
-            '科目汇总': work / 'kis_accounts_summary.csv' if work else None,
-            '映射草稿': mapping if mapping else (work / 'mapping_draft.csv' if work else None),
-            '标准科目': work / 'standard_accounts_draft.csv' if work else None,
-            '核算项目': work / 'kis_auxiliary_items.csv' if work else None,
-            '扫描错误': work / 'kis_scan_errors.csv' if work else None,
-            '扫描性能': work / 'kis_scan_performance.csv' if work else None,
+            '科目汇总': work / '02_多年科目汇总_去重.csv' if work else None,
+            '映射草稿': mapping if mapping else (work / '04_科目映射确认表.csv' if work else None),
+            '标准科目': work / '02_多年科目汇总_去重.csv' if work else None,
+            '核算项目': work / '06_核算项目汇总.csv' if work else None,
+            '扫描错误': work / '07_扫描错误报告.csv' if work else None,
+            '扫描性能': work / '08_扫描性能统计.csv' if work else None,
             '预检报告': out / 'preflight_report.csv' if out else None,
             '引用字段': out / 'reference_fields_report.csv' if out else None,
-            '试运行审计': out / 'apply_audit_dryrun.csv' if out else None,
-            '正式审计': out / 'apply_audit_commit.csv' if out else None,
+            '试运行审计': out / '09_账套修改审计.csv' if out else None,
+            '正式审计': out / '09_账套修改审计.csv' if out else None,
         }
         return files.get(title)
 
@@ -375,11 +375,10 @@ class App(tk.Tk):
         work = Path(self.work_dir.get()) if self.work_dir.get().strip() else None
         out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
         sources = [
-            ('扫描错误', work / 'kis_scan_errors.csv' if work else None),
+            ('扫描错误', work / '07_扫描错误报告.csv' if work else None),
             ('预检报告', out / 'preflight_report.csv' if out else None),
             ('引用字段', out / 'reference_fields_report.csv' if out else None),
-            ('试运行审计', out / 'apply_audit_dryrun.csv' if out else None),
-            ('正式审计', out / 'apply_audit_commit.csv' if out else None),
+            ('账套修改审计', out / '09_账套修改审计.csv' if out else None),
         ]
         for source, path in sources:
             for row in self.read_csv_rows(path):
@@ -434,7 +433,7 @@ class App(tk.Tk):
 
     def open_mapping(self):
         if not self.mapping_file.get().strip():
-            candidate = Path(self.work_dir.get()) / 'mapping_draft.csv' if self.work_dir.get().strip() else None
+            candidate = Path(self.work_dir.get()) / '04_科目映射确认表.csv' if self.work_dir.get().strip() else None
             if candidate and candidate.exists():
                 self.mapping_file.set(str(candidate))
         self.open_path(self.mapping_file.get())
