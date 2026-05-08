@@ -17,18 +17,19 @@
 - 科目名称只用于显示和判断“同编码不同名称”。
 - 同名不同编码视为不同科目，不提示、不合并、不自动改码。
 - 不按名称推断一级科目，不按名称自动合并，不随意生成新编码。
-- `needs_recode` 行的 `new_code` 会留空，必须人工确认后填写。
+- 只有同编码不同名称、跨年度父级需下设明细这两类会进入人工确认表。
+- `needs_recode` 行会按 `GLPref.FAcLen1..FAcLen6` 的分段级次自动生成 `new_code`，人工只负责复核并确认。
+- `FAcLen1..FAcLen6` 是分段长度，例如 `3-2-2`；判断父级时内部临时换算为累计长度 `3,5,7`，写回 `GLPref` 时仍写分段长度。
 
 ## 推荐流程
 
 1. 准备账套目录，里面可以包含多个 `.AIS/.AIY/.AXX/.MDB` 文件。
-2. 运行快速扫描 `scan-kis`，生成 01-09 号 CSV。
+2. 运行快速扫描 `scan-kis`，生成汇总表、人工确认表和辅助报告。
 3. 重点查看：
-   - `02_多年科目汇总_去重.csv`
-   - `03_科目编码冲突检查.csv`
-   - `04_科目映射确认表.csv`
-   - `05_科目级次修改计划.csv`
-4. 在 `04_科目映射确认表.csv` 中人工填写需要重编码的 `new_code`，确认后把 `confirmed` 填为 `Y`。
+   - `01_多年科目汇总_去重.csv`
+   - `02_需要人工确认的科目重编码表.csv`
+   - `03_科目级次修改计划.csv`
+4. 在 `02_需要人工确认的科目重编码表.csv` 中复核自动生成的新编码和新名称，确认后把 `confirmed` 填为 `Y`。
 5. 先运行 dry-run，确认 `preflight_report.csv` 和 `09_账套修改审计.csv` 没有阻断项。
 6. 最后再 commit，工具会复制账套副本并只修改副本。
 
@@ -56,23 +57,22 @@
 快速扫描统一输出：
 
 ```text
-01_账套科目原始明细.csv
-02_多年科目汇总_去重.csv
-03_科目编码冲突检查.csv
-04_科目映射确认表.csv
-05_科目级次修改计划.csv
-06_核算项目汇总.csv
-07_扫描错误报告.csv
-08_扫描性能统计.csv
-09_账套修改审计.csv
+00_账套科目原始明细.csv
+01_多年科目汇总_去重.csv
+02_需要人工确认的科目重编码表.csv
+03_科目级次修改计划.csv
+04_核算项目汇总.csv
+05_扫描错误报告.csv
+06_扫描性能统计.csv
+07_账套修改审计.csv
 ```
 
 说明：
 
-- `01_账套科目原始明细.csv` 不去重，保留每个账套、年度、文件 ID、原始编码、原始名称。
-- `02_多年科目汇总_去重.csv` 只删除 `科目编码 + 科目名称` 完全重复项。
-- `03_科目编码冲突检查.csv` 只检查同编码不同名称等真正需要处理的问题。
-- `04_科目映射确认表.csv` 是 apply 的输入文件，必须保留 `source_file_id + year + old_code`。
+- `00_账套科目原始明细.csv` 不去重，保留每个账套、年度、文件 ID、原始编码、原始名称。
+- `01_多年科目汇总_去重.csv` 只删除 `科目编码 + 科目名称` 完全重复项，按科目编码排序。
+- `02_需要人工确认的科目重编码表.csv` 只输出需要人工确认的行；普通 `old_code = new_code` 科目不会输出。
+- 人工确认表保留 `source_file_id + year + old_code`，apply 时按账套文件 ID、年度和旧编码定位，不能只按旧编码全局替换。
 - `09_账套修改审计.csv` 记录 dry-run 或 commit 的计划和执行情况。
 
 ## 命令行使用
@@ -86,13 +86,13 @@ python kis_multi_year_account_standardizer.py scan-kis --input "账套目录" --
 试运行：
 
 ```powershell
-python kis_multi_year_account_standardizer.py apply --mapping "工作目录\04_科目映射确认表.csv" --out "副本输出目录" --dry-run
+python kis_multi_year_account_standardizer.py apply --mapping "工作目录\02_需要人工确认的科目重编码表.csv" --out "副本输出目录" --dry-run
 ```
 
 正式写入副本：
 
 ```powershell
-python kis_multi_year_account_standardizer.py apply --mapping "工作目录\04_科目映射确认表.csv" --out "副本输出目录" --commit
+python kis_multi_year_account_standardizer.py apply --mapping "工作目录\02_需要人工确认的科目重编码表.csv" --out "副本输出目录" --commit
 ```
 
 `kiszt.py` 也支持同样的命令，同时提供一个简化图形向导：
@@ -113,7 +113,8 @@ python kiszt.py
 - 科目表 `GLAcct` 由独立逻辑处理，不作为普通引用字段更新；
 - 业务表只按白名单字段更新；
 - 任意写库错误都会 rollback；
-- `confirmed != Y`、旧科目不存在、缺父级、重复目标编码等都会阻止 commit；
+- 人工确认表中 `confirmed != Y` 的行默认跳过，不写账套；
+- 已确认行如果旧科目不存在、缺父级、重复目标编码等会阻止 commit；
 - 输出目录已有同名副本时默认阻止覆盖。
 
 第一批白名单引用字段包括：
@@ -169,7 +170,7 @@ Access_ODBC_IM002修复说明.md
 建议顺序永远是：
 
 ```text
-scan-kis -> 人工审核 04_科目映射确认表.csv -> dry-run -> 查看审计 -> commit
+scan-kis -> 人工审核 02_需要人工确认的科目重编码表.csv -> dry-run -> 查看审计 -> commit
 ```
 
 不要跳过 dry-run。

@@ -58,7 +58,7 @@ class App(tk.Tk):
         ttk.Label(root, text=APP_TITLE, font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
         ttk.Label(
             root,
-            text='按步骤处理老 AIS 账套：先快速扫描关键 KIS 表，在软件里查看科目对比和映射草稿，确认后再试运行和生成副本。',
+            text='按步骤处理老 AIS 账套：先快速扫描关键 KIS 表，在软件里查看科目汇总和人工确认表，确认后再试运行和生成副本。',
             wraplength=1100,
         ).pack(anchor='w', pady=(4, 12))
 
@@ -100,7 +100,7 @@ class App(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True)
         for title in [
             '科目汇总',
-            '映射草稿',
+            '人工确认',
             '问题汇总',
             '标准科目',
             '核算项目',
@@ -250,9 +250,9 @@ class App(tk.Tk):
             argv += ['--config', self.config_file.get()]
 
         def done():
-            mapping = Path(self.work_dir.get()) / '04_科目映射确认表.csv'
+            mapping = Path(self.work_dir.get()) / '02_需要人工确认的科目重编码表.csv'
             self.mapping_file.set(str(mapping))
-            self.status_text.set('快速扫描完成。请先查看“映射草稿”和“扫描错误”，必要时打开映射 CSV 修改确认列。')
+            self.status_text.set('快速扫描完成。请先查看“人工确认”和“扫描错误”，必要时打开确认 CSV 复核自动编码并修改 confirmed 列。')
             self.refresh_previews()
 
         self.run_core(argv, '快速扫描完成。', done)
@@ -335,12 +335,12 @@ class App(tk.Tk):
         out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
         mapping = Path(self.mapping_file.get()) if self.mapping_file.get().strip() else None
         files = {
-            '科目汇总': work / '02_多年科目汇总_去重.csv' if work else None,
-            '映射草稿': mapping if mapping else (work / '04_科目映射确认表.csv' if work else None),
-            '标准科目': work / '02_多年科目汇总_去重.csv' if work else None,
-            '核算项目': work / '06_核算项目汇总.csv' if work else None,
-            '扫描错误': work / '07_扫描错误报告.csv' if work else None,
-            '扫描性能': work / '08_扫描性能统计.csv' if work else None,
+            '科目汇总': work / '01_多年科目汇总_去重.csv' if work else None,
+            '人工确认': mapping if mapping else (work / '02_需要人工确认的科目重编码表.csv' if work else None),
+            '标准科目': work / '01_多年科目汇总_去重.csv' if work else None,
+            '核算项目': work / '04_核算项目汇总.csv' if work else None,
+            '扫描错误': work / '05_扫描错误报告.csv' if work else None,
+            '扫描性能': work / '06_扫描性能统计.csv' if work else None,
             '预检报告': out / 'preflight_report.csv' if out else None,
             '引用字段': out / 'reference_fields_report.csv' if out else None,
             '试运行审计': out / '09_账套修改审计.csv' if out else None,
@@ -375,7 +375,7 @@ class App(tk.Tk):
         work = Path(self.work_dir.get()) if self.work_dir.get().strip() else None
         out = Path(self.output_dir.get()) if self.output_dir.get().strip() else None
         sources = [
-            ('扫描错误', work / '07_扫描错误报告.csv' if work else None),
+            ('扫描错误', work / '05_扫描错误报告.csv' if work else None),
             ('预检报告', out / 'preflight_report.csv' if out else None),
             ('引用字段', out / 'reference_fields_report.csv' if out else None),
             ('账套修改审计', out / '09_账套修改审计.csv' if out else None),
@@ -433,7 +433,7 @@ class App(tk.Tk):
 
     def open_mapping(self):
         if not self.mapping_file.get().strip():
-            candidate = Path(self.work_dir.get()) / '04_科目映射确认表.csv' if self.work_dir.get().strip() else None
+            candidate = Path(self.work_dir.get()) / '02_需要人工确认的科目重编码表.csv' if self.work_dir.get().strip() else None
             if candidate and candidate.exists():
                 self.mapping_file.set(str(candidate))
         self.open_path(self.mapping_file.get())

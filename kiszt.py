@@ -235,6 +235,63 @@ def mapping_code_lengths(rows):
             if v: codes.append(v)
     return code_lengths(codes)
 
+def segments_to_cumulative(segments):
+    out=[]; total=0
+    for n in segments:
+        try: n=int(n)
+        except Exception: continue
+        if n<=0: continue
+        total+=n; out.append(total)
+    return out
+
+def cumulative_to_segments(lengths):
+    out=[]; prev=0
+    for n in sorted(set(int(x) for x in lengths if str(x).isdigit() or isinstance(x,int))):
+        if n<=prev: continue
+        out.append(n-prev); prev=n
+    return out
+
+def pref_segments_from_row(row):
+    out=[]
+    for k in ['FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']:
+        v=sql_value(row.get(k,''))
+        if v.isdigit() and int(v)>0: out.append(int(v))
+    return out
+
+def level_rule_text(segments):
+    return '-'.join(str(x) for x in segments if int(x)>0)
+
+def group_cumulative_lengths(rows):
+    lengths=set()
+    codes=[]
+    for r in rows:
+        lengths.update(pref_lengths_from_row(r))
+        for k in ['old_code','new_code']:
+            v=row_value(r,k)
+            if v: codes.append(v)
+    lengths.update(code_lengths(codes))
+    return sorted(lengths)
+
+def next_code_under_parent(parent,width,used):
+    parent=sql_value(parent); width=max(1,int(width or 1)); nums=[]
+    for c in used:
+        c=sql_value(c)
+        if c.startswith(parent) and len(c)==len(parent)+width:
+            s=c[len(parent):]
+            if s.isdigit(): nums.append(int(s))
+    n=max(nums or [0])+1
+    while True:
+        c=parent+str(n).zfill(width)
+        if c not in used:
+            used.add(c); return c
+        n+=1
+
+def next_child_length(parent_code,lengths,default_width=2):
+    parent_code=sql_value(parent_code); plen=len(parent_code)
+    bigger=[x for x in sorted(lengths) if x>plen]
+    if bigger: return bigger[0]
+    return plen+int(default_width or 2)
+
 def required_parent_codes(code,lengths):
     code=sql_value(code)
     out=[]
@@ -277,12 +334,13 @@ def normalize_mapping_row(r):
         'year':['year','年度'],
         'old_code':['old_code','旧科目编码','原始科目编码'],
         'old_name':['old_name','旧科目名称','原始科目名称'],
-        'new_code':['new_code','新科目编码'],
-        'new_name':['new_name','新科目名称'],
+        'new_code':['new_code','新科目编码','自动生成新编码'],
+        'new_name':['new_name','新科目名称','自动生成新名称'],
         'new_parent_code':['new_parent_code','新父级编码','父级编码'],
         'action':['action','处理动作'],
         'confirmed':['confirmed','是否确认'],
         'risk_level':['risk_level','风险级别'],
+        'conflict_type':['conflict_type','冲突类型'],
         'source_db_table':['source_db_table','来源表'],
         'source_code_field':['source_code_field','编码字段'],
         'source_name_field':['source_name_field','名称字段'],
@@ -293,11 +351,7 @@ def normalize_mapping_row(r):
     return out
 
 def pref_lengths_from_row(row):
-    out=[]
-    for k in ['FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']:
-        v=sql_value(row.get(k,''))
-        if v.isdigit() and int(v)>0: out.append(int(v))
-    return sorted(set(out))
+    return segments_to_cumulative(pref_segments_from_row(row))
 
 def pref_values_from_row(row,prefix=''):
     return {prefix+k:sql_value(row.get(k,'')) for k in ['FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']}
@@ -501,7 +555,7 @@ class AccessDB:
                 if y: info['year']=y; break
             if 'year' not in info: info['year']=''
             info['年度']=info.get('year','')
-            level_lengths=sorted(set([int(info[k]) for k in ['FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6'] if sql_value(info.get(k)).isdigit() and int(info[k])>0]))
+            level_lengths=pref_lengths_from_row(info)
             if self.fast_table_exists(conn,'GLAcct'):
                 touched.append('GLAcct')
                 cf=self.fast_pick_field(conn,'GLAcct',['FAcctID','FNumber','FCode','AcctCode','AccountCode'])
@@ -546,8 +600,10 @@ class AccessDB:
     def account_code_lengths(self,conn):
         try:
             r=self.account_level_pref(conn)
-            return sorted(set([int(r[k]) for k in r if sql_value(r[k]).isdigit() and int(r[k])>0]))
+            return pref_lengths_from_row(r)
         except Exception: return []
+    def account_level_lengths(self,conn):
+        return self.account_code_lengths(conn)
     def account_level_pref(self,conn):
         return self.one(conn,'SELECT FAcLevels,FAcLen1,FAcLen2,FAcLen3,FAcLen4,FAcLen5,FAcLen6 FROM [GLPref]')
     def desired_account_code_lengths(self,conn,maps,table='',code_field=''):
@@ -574,17 +630,18 @@ class AccessDB:
         if not desired: return audit
         current=self.account_level_lengths(conn)
         target=sorted(set((current or [])+desired))
+        target_segments=cumulative_to_segments(target)
         max_levels=int(self.cfg.get('max_account_levels',6) or 6)
-        if len(target)>max_levels:
-            msg='目标科目编码级次需要 %s 个不同长度：%s；KIS 迷你版通常最多支持 %s 级，请先调整映射编码。'%(len(target),target,max_levels)
+        if len(target_segments)>max_levels:
+            msg='目标科目编码级次需要 %s 级：%s；KIS 迷你版通常最多支持 %s 级，请先调整映射编码。'%(len(target_segments),level_rule_text(target_segments),max_levels)
             audit.append(audit_row(table='GLPref',action='account_level_error',risk_level='error',reason=msg,planned_sql_type='UPDATE_GLPREF',dry_run=yn(dry),blocked_commit='Y'))
             if not dry: raise RuntimeError(msg)
             return audit
-        old_pref=self.account_level_pref(conn); old=current; padded=target+[0]*(6-len(target))
-        audit.append(audit_row(table='GLPref',action='account_level_plan',risk_level='info',reason='更新 GLPref 科目级次，确保支持后续目标编码',planned_sql_type='UPDATE_GLPREF',affected_rows=1 if old!=target else 0,dry_run=yn(dry),blocked_commit='N',old_FAcLevels=sql_value(old_pref.get('FAcLevels')),old_FAcLen1=sql_value(old_pref.get('FAcLen1')),old_FAcLen2=sql_value(old_pref.get('FAcLen2')),old_FAcLen3=sql_value(old_pref.get('FAcLen3')),old_FAcLen4=sql_value(old_pref.get('FAcLen4')),old_FAcLen5=sql_value(old_pref.get('FAcLen5')),old_FAcLen6=sql_value(old_pref.get('FAcLen6')),new_FAcLevels=len(target),new_FAcLen1=padded[0],new_FAcLen2=padded[1],new_FAcLen3=padded[2],new_FAcLen4=padded[3],new_FAcLen5=padded[4],new_FAcLen6=padded[5],old_lengths=','.join(map(str,old)),new_lengths=','.join(map(str,target))))
+        old_pref=self.account_level_pref(conn); old=current; old_segments=pref_segments_from_row(old_pref); padded=target_segments+[0]*(6-len(target_segments))
+        audit.append(audit_row(table='GLPref',action='account_level_plan',risk_level='info',reason='更新 GLPref 科目级次，确保支持后续目标编码',planned_sql_type='UPDATE_GLPREF',affected_rows=1 if old!=target else 0,dry_run=yn(dry),blocked_commit='N',old_FAcLevels=sql_value(old_pref.get('FAcLevels')),old_FAcLen1=sql_value(old_pref.get('FAcLen1')),old_FAcLen2=sql_value(old_pref.get('FAcLen2')),old_FAcLen3=sql_value(old_pref.get('FAcLen3')),old_FAcLen4=sql_value(old_pref.get('FAcLen4')),old_FAcLen5=sql_value(old_pref.get('FAcLen5')),old_FAcLen6=sql_value(old_pref.get('FAcLen6')),new_FAcLevels=len(target_segments),new_FAcLen1=padded[0],new_FAcLen2=padded[1],new_FAcLen3=padded[2],new_FAcLen4=padded[3],new_FAcLen5=padded[4],new_FAcLen6=padded[5],old_lengths=level_rule_text(old_segments),new_lengths=level_rule_text(target_segments),old_cumulative=','.join(map(str,old)),new_cumulative=','.join(map(str,target))))
         if old==target: return audit
         if not dry:
-            cur.execute('UPDATE [GLPref] SET [FAcLevels]=?, [FAcLen1]=?, [FAcLen2]=?, [FAcLen3]=?, [FAcLen4]=?, [FAcLen5]=?, [FAcLen6]=?',len(target),padded[0],padded[1],padded[2],padded[3],padded[4],padded[5])
+            cur.execute('UPDATE [GLPref] SET [FAcLevels]=?, [FAcLen1]=?, [FAcLen2]=?, [FAcLen3]=?, [FAcLen4]=?, [FAcLen5]=?, [FAcLen6]=?',len(target_segments),padded[0],padded[1],padded[2],padded[3],padded[4],padded[5])
         return audit
     def schema_rows(self,conn,file,account_table):
         out=[]
@@ -642,7 +699,7 @@ class AccessDB:
             old=sql_value(r.get('old_code','')); new=sql_value(r.get('new_code','')); action=sql_value(r.get('action','')).lower()
             if not old or not new: continue
             final.add(new)
-            if old!=new and action not in MERGE_ACTIONS and old in final: final.remove(old)
+            if old!=new and action not in MERGE_ACTIONS and action!='create_year_dedicated_child' and old in final: final.remove(old)
         return final
     def add_preflight(self,out,row,check,risk,reason,dry,blocked=None,**extra):
         if blocked is None: blocked=risk in ('error','high')
@@ -664,7 +721,7 @@ class AccessDB:
             if not sql_value(r.get('new_code','')): self.add_preflight(pre,r,'missing_new_code','error','new_code 为空',dry)
             if sql_value(r.get('confirmed','')).upper()!='Y': self.add_preflight(pre,r,'unconfirmed_mapping','error','confirmed != Y，commit 默认阻止',dry)
             if sql_value(r.get('action','')).lower()=='create_year_dedicated_child':
-                self.add_preflight(pre,r,'unsupported_create_year_dedicated_child','error','当前实现只是重编码，不会 INSERT 创建新子科目；commit 必须阻止',dry)
+                self.add_preflight(pre,r,'create_year_dedicated_child_plan','warning','将复制父科目行 INSERT 新下级科目，并把该年度引用迁移到新编码',dry,blocked=False)
         by_locator=defaultdict(list)
         for r in all_rows:
             old=sql_value(r.get('old_code',''))
@@ -684,12 +741,12 @@ class AccessDB:
             conn=self.connect(src)
             try:
                 info=self.ledger_info(conn,src); actual_fid=source_file_id(src); actual_year=row_value(info,'year')
-                table,f=self.account_table(conn); cf,nf=f['code'],f['name']; accounts=self.account_map(conn,table,cf,nf); final_codes=self.final_code_set(accounts,all_rows); lengths=code_lengths(final_codes); current_lengths=self.account_level_lengths(conn); target_lengths=sorted(set((current_lengths or [])+lengths)); max_levels=int(self.cfg.get('max_account_levels',6) or 6)
+                table,f=self.account_table(conn); cf,nf=f['code'],f['name']; accounts=self.account_map(conn,table,cf,nf); final_codes=self.final_code_set(accounts,all_rows); lengths=code_lengths(final_codes); current_lengths=self.account_level_lengths(conn); target_lengths=sorted(set((current_lengths or [])+lengths)); target_segments=cumulative_to_segments(target_lengths); max_levels=int(self.cfg.get('max_account_levels',6) or 6)
                 safe_refs,ref_report=self.reference_fields(conn,table,cf,src,dry)
                 if any(is_blocking(x) for x in ref_report):
                     pre.append(audit_row(source_file=src,action='unsafe_reference_fields',risk_level='warning',reason='存在无法确认安全的引用字段；dry-run 仅报告，commit 阻止',planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='Y'))
-                if len(target_lengths)>max_levels:
-                    pre.append(audit_row(source_file=src,action='account_level_check',risk_level='error',reason='最终科目编码级次需要 %s 个不同长度 %s，超过 max_account_levels=%s'%(len(target_lengths),target_lengths,max_levels),planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='Y'))
+                if len(target_segments)>max_levels:
+                    pre.append(audit_row(source_file=src,action='account_level_check',risk_level='error',reason='最终科目编码级次需要 %s 级 %s，超过 max_account_levels=%s'%(len(target_segments),level_rule_text(target_segments),max_levels),planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='Y'))
                 active_lengths=mapping_code_lengths(active_rows); all_lengths=mapping_code_lengths(all_rows)
                 if set(all_lengths)-set(active_lengths):
                     pre.append(audit_row(source_file=src,action='account_level_from_skipped_mapping',risk_level='warning',reason='科目级次扩展来自未确认或被跳过映射：%s'%(sorted(set(all_lengths)-set(active_lengths))),planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='Y'))
@@ -722,20 +779,37 @@ class AccessDB:
             table,f=self.account_table(conn); cf,nf,pf=f['code'],f['name'],f.get('parent'); cur=conn.cursor(); refs=self.refs(conn,table,cf,src,dry); audit+=self.ensure_account_levels(conn,cur,maps,table,cf,dry)
             for row in audit:
                 if not row.get('source_file'): row['source_file']=src
+            def update_refs(old,new,m):
+                for t,c in refs:
+                    try:
+                        cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(t,c),old); cnt=int(cur.fetchone()[0] or 0)
+                        audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=m.get('new_name',''),action='update_reference',risk_level='info',reason='更新引用表字段',planned_sql_type='UPDATE_REFERENCE',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src,affected=cnt))
+                        if cnt and not dry: cur.execute('UPDATE [%s] SET [%s]=? WHERE [%s]=?'%(t,c,c),new,old)
+                    except Exception as e:
+                        audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=m.get('new_name',''),action='update_reference_error',risk_level='error',reason=str(e),planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='Y',file=src,error=str(e)))
+                        if not dry: raise
             for m in maps:
-                old=m['old_code'].strip(); new=m['new_code'].strip(); name=m['new_name'].strip(); parent=m.get('new_parent_code','').strip()
+                old=m['old_code'].strip(); new=m['new_code'].strip(); name=m['new_name'].strip(); parent=m.get('new_parent_code','').strip(); action_type=sql_value(m.get('action','')).lower()
                 if not old or not new: continue
-                if old!=new:
-                    for t,c in refs:
-                        try:
-                            cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(t,c),old); cnt=int(cur.fetchone()[0] or 0)
-                            audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_reference',risk_level='info',reason='更新引用表字段',planned_sql_type='UPDATE_REFERENCE',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src,affected=cnt))
-                            if cnt and not dry: cur.execute('UPDATE [%s] SET [%s]=? WHERE [%s]=?'%(t,c,c),new,old)
-                        except Exception as e:
-                            audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_reference_error',risk_level='error',reason=str(e),planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='Y',file=src,error=str(e)))
-                            if not dry: raise
                 try:
                     cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),new); exists=int(cur.fetchone()[0] or 0)>0
+                    if action_type=='create_year_dedicated_child':
+                        cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
+                        audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='insert_child_account',risk_level='info',reason='复制父科目行创建年度专用下级科目，父科目保留',planned_sql_type='INSERT_ACCOUNT',affected_rows=0 if exists else cnt,dry_run=yn(dry),blocked_commit='N',file=src,new_parent_code=parent))
+                        if not dry and not exists and cnt:
+                            cols=self.cols(conn,table)
+                            cur.execute('SELECT '+','.join('[%s]'%x for x in cols)+' FROM [%s] WHERE [%s]=?'%(table,cf),old)
+                            src_row=cur.fetchone()
+                            if src_row is None: raise RuntimeError('旧科目不存在，无法创建下级科目：%s'%old)
+                            vals=list(src_row)
+                            for idx,col in enumerate(cols):
+                                if col==cf: vals[idx]=new
+                                elif col==nf: vals[idx]=name
+                                elif pf and col==pf: vals[idx]=parent
+                            cur.execute('INSERT INTO [%s] (%s) VALUES (%s)'%(table,','.join('[%s]'%x for x in cols),','.join(['?']*len(cols))),vals)
+                        if old!=new: update_refs(old,new,m)
+                        continue
+                    if old!=new: update_refs(old,new,m)
                     if old==new:
                         cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
                         audit.append(audit_row(source_file=src,table=table,field=nf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_account_name',risk_level='info',reason='更新科目名称',planned_sql_type='UPDATE_ACCOUNT_NAME',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src,code=old))
@@ -827,46 +901,94 @@ def build_conflicts(raw_rows,summary_rows):
     return sorted(out,key=account_sort_key)
 
 def build_mapping_confirmation(raw_rows,summary_rows,cfg):
-    code_names=defaultdict(set)
-    for r in summary_rows:
-        group=row_value(r,'ledger_group'); code=row_value(r,'old_code'); name=row_value(r,'old_name')
-        if code and name: code_names[(group,code)].add(name)
-    out=[]; seen_rows=set()
+    out=[]; raw_unique=[]; seen=set()
     for r in sorted(raw_rows,key=account_sort_key):
-        row_key=(row_value(r,'source_file_id'),row_value(r,'year'),row_value(r,'old_code'),row_value(r,'old_name'))
-        if row_key in seen_rows: continue
-        seen_rows.add(row_key)
-        group=row_value(r,'ledger_group'); old=row_value(r,'old_code'); name=row_value(r,'old_name')
-        new_code=old; new_name=name; action='keep'; risk='info'; confirmed='Y'; reason=''
-        if len(code_names.get((group,old),set()))>1:
-            new_code=''; action='needs_recode'; risk='high'; confirmed='N'; reason='同一账套组多年度中，同一个旧编码对应多个名称，必须保留年度和账套文件ID后由人工填写新编码'
-        lengths=pref_lengths_from_row(r) or code_lengths([row_value(x,'old_code') for x in raw_rows if row_value(x,'ledger_group')==group])
-        new_parent=parent_from_code(new_code,lengths) or row_value(r,'old_parent_code')
-        row={**r,'旧科目编码':old,'旧科目名称':name,'新科目编码':new_code,'新科目名称':new_name,'处理动作':action,'是否确认':confirmed,'风险级别':risk,'new_code':new_code,'new_name':new_name,'new_parent_code':new_parent,'action':action,'confirmed':confirmed,'risk_level':risk,'reason':reason}
-        out.append(row)
+        key=(row_value(r,'source_file_id'),row_value(r,'year'),row_value(r,'old_code'),row_value(r,'old_name'))
+        if key in seen: continue
+        seen.add(key); raw_unique.append(r)
+    by_group=defaultdict(list)
+    for r in raw_unique: by_group[row_value(r,'ledger_group')].append(r)
+    summary_by_group=defaultdict(list)
+    for r in summary_rows: summary_by_group[row_value(r,'ledger_group')].append(r)
+    default_width=int(cfg.get('generated_code_width',2) or 2)
+    for group,group_rows in by_group.items():
+        summary_group=summary_by_group.get(group,[])
+        lengths=group_cumulative_lengths(group_rows+summary_group)
+        segments=cumulative_to_segments(lengths)
+        used=set(row_value(r,'old_code') for r in summary_group if row_value(r,'old_code'))
+        mapped_keys=set()
+        by_code=defaultdict(list)
+        for r in summary_group: by_code[row_value(r,'old_code')].append(r)
+        for old,rows in sorted(by_code.items(),key=lambda x:x[0]):
+            names=sorted(set(row_value(r,'old_name') for r in rows if row_value(r,'old_name')))
+            if len(names)<=1: continue
+            raw_for_code=[r for r in group_rows if row_value(r,'old_code')==old]
+            by_name=defaultdict(list)
+            for r in raw_for_code: by_name[row_value(r,'old_name')].append(r)
+            def name_rank(item):
+                name,items=item
+                years=sorted(set(row_value(x,'year') for x in items if row_value(x,'year')))
+                earliest=years[0] if years else '9999'
+                return (-len(years),earliest,name)
+            keep_name=sorted(by_name.items(),key=name_rank)[0][0]
+            parent=parent_from_code(old,lengths)
+            width=len(old)-len(parent) if old else default_width
+            for name,items in sorted(by_name.items(),key=lambda item:(min([row_value(x,'year') or '9999' for x in item[1]]),item[0])):
+                if name==keep_name: continue
+                new_code=next_code_under_parent(parent,width,used)
+                rule='按 GLPref 分段级次 %s，在父级 %s 下取下一个 %s 位可用编码'%(level_rule_text(segments) or '未知',parent or '根级',width)
+                for r in sorted(items,key=account_sort_key):
+                    key=(row_value(r,'source_file_id'),row_value(r,'year'),old)
+                    if key in mapped_keys: continue
+                    mapped_keys.add(key)
+                    row={**r,'账套组':group,'冲突类型':'同编码不同名称','旧科目编码':old,'旧科目名称':name,'自动生成新编码':new_code,'自动生成新名称':name,'编码规则':rule,'是否确认':'N','原因':'同一科目编码对应多个科目名称，保留出现年度最多或最早年度的名称使用原编码，其余自动分配同级新编码','new_code':new_code,'new_name':name,'new_parent_code':parent,'action':'needs_recode','confirmed':'N','risk_level':'high','conflict_type':'same_code_different_name','reason':'同一科目编码对应多个科目名称，需要人工确认自动重编码'}
+                    out.append(row)
+        group_codes=set(row_value(r,'old_code') for r in summary_group if row_value(r,'old_code'))
+        children_by_parent=defaultdict(list)
+        for code in group_codes:
+            for parent in required_parent_codes(code,lengths):
+                children_by_parent[parent].append(code)
+        rows_by_file_year=defaultdict(list)
+        for r in group_rows:
+            rows_by_file_year[(row_value(r,'source_file_id'),row_value(r,'year'))].append(r)
+        for r in sorted(group_rows,key=account_sort_key):
+            old=row_value(r,'old_code')
+            if not old or old not in children_by_parent: continue
+            key=(row_value(r,'source_file_id'),row_value(r,'year'),old)
+            if key in mapped_keys: continue
+            same_year_codes=[row_value(x,'old_code') for x in rows_by_file_year[(row_value(r,'source_file_id'),row_value(r,'year'))]]
+            if any(c!=old and c.startswith(old) and len(c)>len(old) for c in same_year_codes): continue
+            child_len=next_child_length(old,lengths,default_width); width=child_len-len(old)
+            new_code=next_code_under_parent(old,width,used); year=row_value(r,'year')
+            new_name=(year+'年') if year else (row_value(r,'old_name')+'明细')
+            rule='按 GLPref 分段级次 %s，在父级 %s 下新增 %s 位下级编码'%(level_rule_text(segments) or '未知',old,width)
+            mapped_keys.add(key)
+            row={**r,'账套组':group,'冲突类型':'跨年度父级科目需下设明细','旧科目编码':old,'旧科目名称':row_value(r,'old_name'),'自动生成新编码':new_code,'自动生成新名称':new_name,'编码规则':rule,'是否确认':'N','原因':'本年度只有父级科目，其他年度已存在该科目的下级明细，需要新增年度专用下级科目','new_code':new_code,'new_name':new_name,'new_parent_code':old,'action':'create_year_dedicated_child','confirmed':'N','risk_level':'high','conflict_type':'year_dedicated_child','reason':'本年度父级科目需要映射到新增下级科目'}
+            out.append(row)
     return sorted(out,key=account_sort_key)
 
 def build_level_plan(mapping_rows,raw_rows,cfg):
-    raw_by_file={}
+    raw_by_file={}; raw_rows_by_file=defaultdict(list)
     for r in raw_rows:
         raw_by_file[row_value(r,'source_file_id')]=r
+        raw_rows_by_file[row_value(r,'source_file_id')].append(r)
     by_file=defaultdict(list)
     for m in mapping_rows: by_file[row_value(m,'source_file_id')].append(m)
     max_levels=int(cfg.get('max_account_levels',6) or 6); out=[]; conflicts=[]
     for fid,rows in by_file.items():
-        raw=raw_by_file.get(fid,rows[0]); codes=sorted(set(row_value(r,'new_code') for r in rows if row_value(r,'new_code')))
-        lengths=code_lengths(codes); cur=pref_lengths_from_row(raw); target_lengths=sorted(set((cur or [])+lengths)); target=target_lengths+[0]*(6-len(target_lengths)); cur_pad=cur+[0]*(6-len(cur))
+        raw=raw_by_file.get(fid,rows[0]); codes=sorted(set(row_value(r,'new_code') for r in rows if row_value(r,'new_code'))); existing_codes=sorted(set(row_value(r,'old_code') for r in raw_rows_by_file.get(fid,[]) if row_value(r,'old_code')))
+        lengths=code_lengths(codes); cur=pref_lengths_from_row(raw); cur_segments=pref_segments_from_row(raw); target_lengths=sorted(set((cur or [])+lengths)); target_segments=cumulative_to_segments(target_lengths); target=target_segments+[0]*(6-len(target_segments))
         risk='info'; reason='当前科目级次已支持目标编码'; need='N'
-        missing=missing_parent_codes(codes,target_lengths)
-        if len(target_lengths)>max_levels:
-            risk='error'; reason='新编码级次超过 %s 级：%s'%(max_levels,target_lengths); need='N'
+        missing=missing_parent_codes(existing_codes+codes,target_lengths)
+        if len(target_segments)>max_levels:
+            risk='error'; reason='新编码级次超过 %s 级：%s'%(max_levels,level_rule_text(target_segments)); need='N'
         elif missing:
             risk='error'; reason='新编码父级缺失：%s'%('|'.join(sorted(set(missing)))); need='N'
         elif not cur:
             risk='error'; reason='无法读取当前 GLPref 科目级次，不能确认是否支持目标编码'; need='N'
         elif any(x not in cur for x in lengths):
             risk='needs_level_update'; reason='当前 GLPref 科目级次不支持目标编码，需要先修改 GLPref'; need='Y'
-        row={'账套文件':row_value(raw,'source_file','ledger_file'),'账套文件ID':fid,'年度':row_value(raw,'year'),'当前 FAcLevels':sql_value(raw.get('FAcLevels')),'当前 FAcLen1':sql_value(raw.get('FAcLen1')),'当前 FAcLen2':sql_value(raw.get('FAcLen2')),'当前 FAcLen3':sql_value(raw.get('FAcLen3')),'当前 FAcLen4':sql_value(raw.get('FAcLen4')),'当前 FAcLen5':sql_value(raw.get('FAcLen5')),'当前 FAcLen6':sql_value(raw.get('FAcLen6')),'目标 FAcLevels':len(target_lengths),'目标 FAcLen1':target[0] if len(target)>0 else 0,'目标 FAcLen2':target[1] if len(target)>1 else 0,'目标 FAcLen3':target[2] if len(target)>2 else 0,'目标 FAcLen4':target[3] if len(target)>3 else 0,'目标 FAcLen5':target[4] if len(target)>4 else 0,'目标 FAcLen6':target[5] if len(target)>5 else 0,'是否需要修改':need,'风险级别':risk,'原因':reason,'source_file':row_value(raw,'source_file','ledger_file'),'source_file_id':fid,'year':row_value(raw,'year'),'risk_level':risk,'reason':reason}
+        row={'账套文件':row_value(raw,'source_file','ledger_file'),'账套文件ID':fid,'年度':row_value(raw,'year'),'当前 FAcLevels':len(cur_segments),'当前 FAcLen1':sql_value(raw.get('FAcLen1')),'当前 FAcLen2':sql_value(raw.get('FAcLen2')),'当前 FAcLen3':sql_value(raw.get('FAcLen3')),'当前 FAcLen4':sql_value(raw.get('FAcLen4')),'当前 FAcLen5':sql_value(raw.get('FAcLen5')),'当前 FAcLen6':sql_value(raw.get('FAcLen6')),'目标 FAcLevels':len(target_segments),'目标 FAcLen1':target[0] if len(target)>0 else 0,'目标 FAcLen2':target[1] if len(target)>1 else 0,'目标 FAcLen3':target[2] if len(target)>2 else 0,'目标 FAcLen4':target[3] if len(target)>3 else 0,'目标 FAcLen5':target[4] if len(target)>4 else 0,'目标 FAcLen6':target[5] if len(target)>5 else 0,'是否需要修改':need,'风险级别':risk,'原因':reason,'当前级次规则':level_rule_text(cur_segments),'目标级次规则':level_rule_text(target_segments),'source_file':row_value(raw,'source_file','ledger_file'),'source_file_id':fid,'year':row_value(raw,'year'),'risk_level':risk,'reason':reason}
         out.append(row)
         if risk in ('error','needs_level_update'): conflicts.append(conflict_row('account_level_check',risk,reason,[raw],source_file_id=fid))
     return out,conflicts
@@ -912,16 +1034,15 @@ def cmd_scan_kis(a):
     level_plan,level_conflicts=build_level_plan(maps,accounts,cfg)
     conflicts+=level_conflicts
     conflicts=sorted(conflicts,key=account_sort_key)
-    std=build_standard_accounts(maps)
     raw_cols=['账套文件','账套文件ID','公司名称','年度','原始科目编码','原始科目名称','父级编码','级次','来源表','编码字段','名称字段','source_file','source_file_id','company','year','old_code','old_name','old_parent_code','level','source_db_table','source_code_field','source_name_field','ledger_group','FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']
     summary_cols=['账套组','科目编码','科目名称','父级编码','出现年度','出现账套数','出现账套文件','ledger_group','old_code','old_name','old_parent_code']
     for r in summary:
         r.setdefault('账套组',row_value(r,'ledger_group')); r.setdefault('科目编码',row_value(r,'old_code')); r.setdefault('科目名称',row_value(r,'old_name')); r.setdefault('父级编码',row_value(r,'old_parent_code'))
     conflict_cols=['check_type','risk_level','reason','账套文件','账套文件ID','公司名称','年度','原始科目编码','原始科目名称','source_file','source_file_id','company','year','old_code','old_name','duplicate_count','names','codes','ledger_group']
-    map_cols=['账套文件','账套文件ID','公司名称','年度','旧科目编码','旧科目名称','新科目编码','新科目名称','处理动作','是否确认','风险级别','来源表','编码字段','名称字段','source_file','source_file_id','company','year','old_code','old_name','new_code','new_name','new_parent_code','action','confirmed','risk_level','source_db_table','source_code_field','source_name_field','ledger_group','reason']
+    map_cols=['账套组','账套文件','账套文件ID','年度','冲突类型','旧科目编码','旧科目名称','自动生成新编码','自动生成新名称','编码规则','是否确认','原因','source_file','source_file_id','year','old_code','old_name','new_code','new_name','new_parent_code','action','confirmed','risk_level','conflict_type','source_db_table','source_code_field','source_name_field','ledger_group','reason']
     for m in maps:
         m.setdefault('账套文件',row_value(m,'source_file')); m.setdefault('账套文件ID',row_value(m,'source_file_id')); m.setdefault('公司名称',row_value(m,'company')); m.setdefault('年度',row_value(m,'year')); m.setdefault('来源表',row_value(m,'source_db_table')); m.setdefault('编码字段',row_value(m,'source_code_field')); m.setdefault('名称字段',row_value(m,'source_name_field'))
-    level_cols=['账套文件','账套文件ID','年度','当前 FAcLevels','当前 FAcLen1','当前 FAcLen2','当前 FAcLen3','当前 FAcLen4','当前 FAcLen5','当前 FAcLen6','目标 FAcLevels','目标 FAcLen1','目标 FAcLen2','目标 FAcLen3','目标 FAcLen4','目标 FAcLen5','目标 FAcLen6','是否需要修改','风险级别','原因','source_file','source_file_id','year','risk_level','reason']
+    level_cols=['账套文件','账套文件ID','年度','当前 FAcLevels','当前 FAcLen1','当前 FAcLen2','当前 FAcLen3','当前 FAcLen4','当前 FAcLen5','当前 FAcLen6','当前级次规则','目标 FAcLevels','目标 FAcLen1','目标 FAcLen2','目标 FAcLen3','目标 FAcLen4','目标 FAcLen5','目标 FAcLen6','目标级次规则','是否需要修改','风险级别','原因','source_file','source_file_id','year','risk_level','reason']
     aux_cols=['账套文件','账套文件ID','公司名称','年度','核算项目来源表','item_code','item_name','item_type','account_code','source_file','source_file_id','company','year','source_table','ledger_group']
     for r in aux:
         r.setdefault('账套文件',row_value(r,'source_file')); r.setdefault('账套文件ID',row_value(r,'source_file_id')); r.setdefault('公司名称',row_value(r,'company')); r.setdefault('年度',row_value(r,'year'))
@@ -931,22 +1052,22 @@ def cmd_scan_kis(a):
     perf_cols=['账套文件','账套文件ID','状态','耗时毫秒','读取科目数','读取核算项目数','读取表','source_file','source_file_id','ledger_file','ledger_name','scan_mode','connected','status','elapsed_ms','account_rows','auxiliary_rows','touched_tables','full_table_scan','full_field_scan','refs_called','write_sql','error']
     for p in perf:
         p.setdefault('账套文件',row_value(p,'source_file','ledger_file')); p.setdefault('账套文件ID',row_value(p,'source_file_id')); p.setdefault('状态',row_value(p,'status')); p.setdefault('耗时毫秒',row_value(p,'elapsed_ms')); p.setdefault('读取科目数',row_value(p,'account_rows')); p.setdefault('读取核算项目数',row_value(p,'auxiliary_rows')); p.setdefault('读取表',row_value(p,'touched_tables'))
-    write_csv_columns(out/'01_账套科目原始明细.csv',accounts,raw_cols)
-    write_csv_columns(out/'02_多年科目汇总_去重.csv',summary,summary_cols)
-    write_csv_columns(out/'03_科目编码冲突检查.csv',conflicts,conflict_cols)
-    write_csv_columns(out/'04_科目映射确认表.csv',maps,map_cols)
-    write_csv_columns(out/'05_科目级次修改计划.csv',level_plan,level_cols)
-    write_csv_columns(out/'06_核算项目汇总.csv',aux,aux_cols)
-    write_csv_columns(out/'07_扫描错误报告.csv',errs,err_cols)
-    write_csv_columns(out/'08_扫描性能统计.csv',perf,perf_cols)
-    write_csv_columns(out/'09_账套修改审计.csv',[],['source_file','source_file_id','year','table','field','old_code','new_code','action','risk_level','reason','affected_rows','dry_run','blocked_commit'])
+    write_csv_columns(out/'00_账套科目原始明细.csv',accounts,raw_cols)
+    write_csv_columns(out/'01_多年科目汇总_去重.csv',summary,summary_cols)
+    write_csv_columns(out/'02_需要人工确认的科目重编码表.csv',maps,map_cols)
+    write_csv_columns(out/'03_科目级次修改计划.csv',level_plan,level_cols)
+    write_csv_columns(out/'04_核算项目汇总.csv',aux,aux_cols)
+    write_csv_columns(out/'05_扫描错误报告.csv',errs,err_cols)
+    write_csv_columns(out/'06_扫描性能统计.csv',perf,perf_cols)
+    write_csv_columns(out/'07_账套修改审计.csv',[],['source_file','source_file_id','year','table','field','old_code','new_code','action','risk_level','reason','affected_rows','dry_run','blocked_commit'])
     print('完成，输出目录：',out)
 def cmd_apply(a):
     cfg=load_config_for_args(a); db=AccessDB(cfg); rows=[normalize_mapping_row(r) for r in read_csv(a.mapping)]; by=defaultdict(list); all_by=defaultdict(list); skipped=[]; out=Path(a.out); audit=[]; preflight=[]; ref_report=[]
     cfg['_target_account_lengths']=[]
     for r in rows:
-        src=row_value(r,'source_file','ledger_file'); all_by[src].append(r)
+        src=row_value(r,'source_file','ledger_file')
         if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
+        all_by[src].append(r)
         by[src].append(r)
     source_years={}
     for src,items in all_by.items():
@@ -1141,7 +1262,7 @@ def _launch_gui():
 
         elif s==2:
             lbl(inner,'扫描账套',13,True,pady=4)
-            lbl(inner,'只读扫描，不修改源文件。扫描后生成 01-09 号 CSV 文件，下一步主要审核 04_科目映射确认表.csv。',color=MUTED,wrap=600)
+            lbl(inner,'只读扫描，不修改源文件。扫描后生成汇总表和人工确认表，下一步主要审核 02_需要人工确认的科目重编码表.csv。',color=MUTED,wrap=600)
             sep(inner)
             entry_row(inner,'账套文件夹',v_src,browse_dir=True)
             entry_row(inner,'工作目录（输出CSV）',v_work,browse_dir=True)
@@ -1180,7 +1301,7 @@ def _launch_gui():
                         sys.stdout=old_out; sys.stderr=old_err
                     def done():
                         if ok:
-                            if v_work.get().strip(): v_map.set(str(Path(v_work.get())/'04_科目映射确认表.csv'))
+                            if v_work.get().strip(): v_map.set(str(Path(v_work.get())/'02_需要人工确认的科目重编码表.csv'))
                             step_done[2].set(True); refresh_sidebar()
                             btn_next.config(state='normal',text='下一步 →',command=lambda:go_step(3))
                         else:
@@ -1190,13 +1311,13 @@ def _launch_gui():
             btn_next.config(text='开始扫描 ▶',command=do_scan)
 
         elif s==3:
-            lbl(inner,'审核 04_科目映射确认表.csv',13,True,pady=4)
-            lbl(inner,'用 Excel 打开工作目录中的 04_科目映射确认表.csv，审核每一行，确认无误后在 confirmed 列填 Y。',color=MUTED,wrap=600)
+            lbl(inner,'审核 02_需要人工确认的科目重编码表.csv',13,True,pady=4)
+            lbl(inner,'用 Excel 打开工作目录中的 02_需要人工确认的科目重编码表.csv，只审核需要处理的行，确认无误后在 confirmed 列填 Y。',color=MUTED,wrap=600)
             sep(inner)
             lbl(inner,'重点列说明：',bold=True)
-            rows=[('action','建议操作类型：keep / needs_recode'),
-                  ('old_code → new_code','原编码到目标编码，两者相同表示只改名称'),
-                  ('new_name','可手动修改，写入时以此为准'),
+            rows=[('action','建议操作类型：needs_recode / create_year_dedicated_child'),
+                  ('old_code → new_code','原编码到自动生成的新编码，普通不改的科目不会出现在这里'),
+                  ('new_name','自动生成的新名称，可手动复核'),
                   ('confirmed','审核通过填 Y，否则该行跳过'),
                   ('risk_level / reason','有冲突时系统会注明风险和原因，需人工判断')]
             for col,tip in rows:
@@ -1205,18 +1326,18 @@ def _launch_gui():
                 tk.Label(f,text=tip,bg=WHITE,fg=MUTED,font=FNT_S,anchor='w',wraplength=460,justify='left').pack(side='left',padx=8)
             info_box(inner,'不要删除任何行，不需执行的行将 confirmed 留空即可。','warn')
             def open_csv():
-                p=Path(v_work.get())/'04_科目映射确认表.csv'
+                p=Path(v_work.get())/'02_需要人工确认的科目重编码表.csv'
                 if p.exists(): os.startfile(str(p))
                 else: messagebox.showinfo('未找到','先完成第三步扫描，再打开文件')
             sep(inner)
-            tk.Button(inner,text='📄  打开 04_科目映射确认表.csv',command=open_csv,font=FNT,bg=PANEL,fg=TEXT,relief='solid',bd=1,padx=12,pady=6,cursor='hand2').pack(anchor='w',padx=24)
+            tk.Button(inner,text='📄  打开 02_需要人工确认的科目重编码表.csv',command=open_csv,font=FNT,bg=PANEL,fg=TEXT,relief='solid',bd=1,padx=12,pady=6,cursor='hand2').pack(anchor='w',padx=24)
             btn_next.config(text='已审核，下一步 →',command=lambda:(step_done[3].set(True),refresh_sidebar(),go_step(4)))
 
         elif s==4:
             lbl(inner,'试运行（dry-run）',13,True,pady=4)
             lbl(inner,'只做预检，不复制文件、不写入任何数据。有阻断项时会列出原因，修改映射表后重新试运行。',color=MUTED,wrap=600)
             sep(inner)
-            entry_row(inner,'04_科目映射确认表.csv',v_map,browse_file=True)
+            entry_row(inner,'02_需要人工确认的科目重编码表.csv',v_map,browse_file=True)
             entry_row(inner,'输出副本目录',v_out,browse_dir=True)
             info_box(inner,'输出目录必须为空，否则预检会报"同名副本已存在"错误。')
             sep(inner)
@@ -1298,7 +1419,7 @@ def _interactive_menu_cmd():
     print(SEP)
     print()
     print('  请选择操作：')
-    print('  [1] scan-kis   扫描账套，生成 01-09 号 CSV')
+    print('  [1] scan-kis   扫描账套，生成汇总表和人工确认表')
     print('  [2] apply      将映射表写入账套副本（含试运行）')
     print('  [Q] 退出')
     print()
@@ -1310,7 +1431,7 @@ def _interactive_menu_cmd():
         sys.argv=['','scan-kis','--input',src,'--out',out]
     elif choice=='2':
         mode=input('  [1]试运行  [2]正式写入：').strip()
-        mapping=input('  04_科目映射确认表.csv 路径：').strip().strip('"')
+        mapping=input('  02_需要人工确认的科目重编码表.csv 路径：').strip().strip('"')
         out=input('  输出副本目录：').strip().strip('"')
         sys.argv=['','apply','--mapping',mapping,'--out',out,('--commit' if mode=='2' else '--dry-run')]
     else:
