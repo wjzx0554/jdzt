@@ -81,8 +81,8 @@ def ledger_output_paths(out,sources,source_years=None):
     out=Path(out)/'处理后账套'; result={}; used=set(); source_years=source_years or {}
     for src in sorted([s for s in sources if s]):
         p=Path(src); yr=sql_value(source_years.get(src,'')) or year_of(src)
-        prefix=yr or '未知年度'
-        candidate=out/('%s_%s'%(prefix,p.name))
+        suffix=yr or '未知年度'
+        candidate=out/('%s_%s%s'%(p.stem,suffix,p.suffix))
         key=str(candidate).lower()
         if key in used:
             candidate=candidate.with_name(candidate.stem+'_'+short_path_id(src)+candidate.suffix)
@@ -1202,7 +1202,8 @@ def cmd_apply(a):
     for src,maps in by.items():
         if not src: continue
         print(('试运行 ' if a.dry_run else '写入副本 ')+src)
-        dst=dst_by.get(src,str(out/'处理后账套'/('%s_%s'%(source_years.get(src,'未知年度'),Path(src).name))))
+        p=Path(src); fallback_year=source_years.get(src,'未知年度')
+        dst=dst_by.get(src,str(out/'处理后账套'/('%s_%s%s'%(p.stem,fallback_year,p.suffix))))
         ledger_audit=[]
         try:
             ledger_audit=db.apply(src,dst,maps,a.dry_run); audit+=ledger_audit
