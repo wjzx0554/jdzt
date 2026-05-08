@@ -258,6 +258,16 @@ def row_value(row,*keys):
         if v: return v
     return ''
 
+def account_sort_key(row):
+    return (
+        row_value(row,'ledger_group','账套组'),
+        row_value(row,'old_code','科目编码','原始科目编码','旧科目编码','new_code','新科目编码'),
+        row_value(row,'old_name','科目名称','原始科目名称','旧科目名称','new_name','新科目名称'),
+        row_value(row,'year','年度'),
+        row_value(row,'source_file_id','账套文件ID'),
+        row_value(row,'source_file','账套文件','ledger_file'),
+    )
+
 def normalize_mapping_row(r):
     out=dict(r)
     aliases={
@@ -772,37 +782,25 @@ def next_code(existing,base,parent='',width=2):
         n+=1
 
 def build_plan(accounts,cfg):
-    acc=sorted(accounts,key=lambda a:(a.get('year') or '9999',a['old_code'],a['old_name']))
-    existing={a['old_code'] for a in acc if a['old_code']}; by_code=defaultdict(list); by_name=defaultdict(list)
-    for a in acc: by_code[a['old_code']].append(a); by_name[norm(a['old_name'])].append(a)
-    name_std={}
-    for nm,rows in by_name.items():
-        if nm:
-            r=sorted(rows,key=lambda x:(x.get('year') or '9999',x['old_code']))[0]; name_std[nm]=(r['old_code'],r['old_name'])
+    acc=sorted(accounts,key=account_sort_key)
+    by_code=defaultdict(list)
+    for a in acc: by_code[a['old_code']].append(a)
     maps=[]; ex=[]
     for code,rows in by_code.items():
         names=list(dict.fromkeys([r['old_name'] for r in rows]))
-        if len(names)>1: ex.append({'type':'同编码多名称','code':code,'names':' | '.join(names),'suggestion':'除第一个名称外，其余名称建议重新编码'})
+        if len(names)>1: ex.append({'type':'同编码多名称','code':code,'names':' | '.join(names),'suggestion':'需要人工确认新编码；工具不自动重编码'})
     for a in acc:
         new_code=a['old_code']; new_name=a['old_name']; action='keep'; conflict=''; reason=''; parent=a.get('old_parent_code','')
-        nm=norm(a['old_name'])
-        if nm in name_std and a['old_code']!=name_std[nm][0]:
-            new_code,new_name=name_std[nm]; action='map_to_existing'; conflict='同名称多编码'; reason='默认映射到最早出现编码，需人工确认'
         names=list(dict.fromkeys([r['old_name'] for r in by_code[a['old_code']]]))
-        if len(names)>1 and a['old_name']!=names[0]:
-            new_code=next_code(existing,a['old_code'],parent,int(cfg.get('generated_code_width',2))); new_name=a['old_name']; action='recode'; conflict='同编码多名称'; reason='同一编码对应不同科目名称，必须重新编码'
+        if len(names)>1:
+            new_code=''; action='needs_recode'; conflict='同编码多名称'; reason='同一编码对应不同科目名称，必须人工填写新编码'
         maps.append({**a,'new_code':new_code,'new_name':new_name,'new_parent_code':parent,'action':action,'conflict_type':conflict,'reason':reason,'confirmed':'N' if conflict else 'Y'})
-    final_codes={m['new_code'] for m in maps}
-    for m in maps:
-        if int(m.get('used_in_voucher') or 0)>0 and any(c!=m['new_code'] and c.startswith(m['new_code']) for c in final_codes):
-            nc=next_code(existing,m['new_code']+'01',m['new_code'],int(cfg.get('generated_code_width',2)))
-            m.update({'new_code':nc,'new_name':m['old_name']+'-'+(m.get('year') or '')+cfg.get('year_dedicated_child_suffix','专用'),'new_parent_code':m['old_code'],'action':'create_year_dedicated_child','conflict_type':'父级科目被凭证使用','reason':'该科目在其他年度存在下级，但本年度凭证直接使用父级','confirmed':'N'})
-    std={m['new_code']:{'科目编码':m['new_code'],'科目名称':m['new_name'],'上级科目编码':m.get('new_parent_code','')} for m in maps}
+    std={m['new_code']:{'科目编码':m['new_code'],'科目名称':m['new_name'],'上级科目编码':m.get('new_parent_code','')} for m in maps if m.get('new_code')}
     return maps,[std[k] for k in sorted(std)],ex
 
 def dedupe_accounts(raw_rows):
     seen={}; out=[]
-    for r in raw_rows:
+    for r in sorted(raw_rows,key=account_sort_key):
         key=(row_value(r,'ledger_group'),row_value(r,'old_code'),row_value(r,'old_name'))
         if key not in seen:
             seen[key]={**r,'出现账套数':0,'出现年度':'','出现账套文件':''}
@@ -812,7 +810,7 @@ def dedupe_accounts(raw_rows):
         if row_value(r,'year'): years.add(row_value(r,'year'))
         if row_value(r,'source_file'): files.add(row_value(r,'source_file'))
         item['出现年度']='|'.join(sorted(years)); item['出现账套文件']='|'.join(sorted(files)); item['出现账套数']=len(files)
-    return out
+    return sorted(out,key=account_sort_key)
 
 def conflict_row(kind,risk,reason,rows,**extra):
     first=rows[0] if rows else {}
@@ -820,52 +818,33 @@ def conflict_row(kind,risk,reason,rows,**extra):
 
 def build_conflicts(raw_rows,summary_rows):
     out=[]
-    groups=defaultdict(list)
-    for r in raw_rows: groups[(row_value(r,'source_file_id'),row_value(r,'year'),row_value(r,'old_code'))].append(r)
-    for key,rows in groups.items():
-        if len(rows)>1: out.append(conflict_row('same_file_year_code_duplicate','error','同一账套文件 + 同一年度 + 科目编码重复，账套内科目编码重复或读取重复',rows,duplicate_count=len(rows)))
-    groups=defaultdict(list)
-    for r in raw_rows: groups[(row_value(r,'source_file_id'),row_value(r,'year'),row_value(r,'old_code'),row_value(r,'old_name'))].append(r)
-    for key,rows in groups.items():
-        if len(rows)>1: out.append(conflict_row('same_file_year_code_name_duplicate','error','同一账套文件 + 同一年度 + 科目编码 + 科目名称重复，可能重复读取或账套数据异常',rows,duplicate_count=len(rows)))
-    by_code=defaultdict(list); by_name=defaultdict(list)
+    by_code=defaultdict(list)
     for r in summary_rows:
         by_code[(row_value(r,'ledger_group'),row_value(r,'old_code'))].append(r)
-        by_name[(row_value(r,'ledger_group'),norm(row_value(r,'old_name')))].append(r)
     for key,rows in by_code.items():
         names=sorted(set(row_value(r,'old_name') for r in rows if row_value(r,'old_name')))
         if len(names)>1: out.append(conflict_row('multi_year_same_code_multi_name','high','多年度汇总后，同一个科目编码对应多个科目名称，必须重新编码或人工确认，后续映射必须带年度',rows,names='|'.join(names),ledger_group=key[0]))
-    for key,rows in by_name.items():
-        codes=sorted(set(row_value(r,'old_code') for r in rows if row_value(r,'old_code')))
-        if key[1] and len(codes)>1: out.append(conflict_row('multi_year_same_name_multi_code','needs_mapping','多年度汇总后，同一个科目名称对应多个科目编码，属于标准化场景，需要生成映射建议',rows,codes='|'.join(codes),ledger_group=key[0]))
-    return out
+    return sorted(out,key=account_sort_key)
 
 def build_mapping_confirmation(raw_rows,summary_rows,cfg):
-    code_names=defaultdict(set); name_codes=defaultdict(set); name_rows=defaultdict(list)
+    code_names=defaultdict(set)
     for r in summary_rows:
         group=row_value(r,'ledger_group'); code=row_value(r,'old_code'); name=row_value(r,'old_name')
         if code and name: code_names[(group,code)].add(name)
-        if name and code:
-            name_codes[(group,norm(name))].add(code); name_rows[(group,norm(name))].append(r)
-    canonical={}
-    for key,rows in name_rows.items():
-        r=sorted(rows,key=lambda x:(row_value(x,'year') or '9999',row_value(x,'old_code')))[0]
-        canonical[key]=(row_value(r,'old_code'),row_value(r,'old_name'))
-    out=[]
-    for r in raw_rows:
+    out=[]; seen_rows=set()
+    for r in sorted(raw_rows,key=account_sort_key):
+        row_key=(row_value(r,'source_file_id'),row_value(r,'year'),row_value(r,'old_code'),row_value(r,'old_name'))
+        if row_key in seen_rows: continue
+        seen_rows.add(row_key)
         group=row_value(r,'ledger_group'); old=row_value(r,'old_code'); name=row_value(r,'old_name')
         new_code=old; new_name=name; action='keep'; risk='info'; confirmed='Y'; reason=''
         if len(code_names.get((group,old),set()))>1:
-            action='needs_recode'; risk='high'; confirmed='N'; reason='同一账套组多年度中，同一个旧编码对应多个名称，必须按年度拆分并人工确认新编码'
-        elif len(name_codes.get((group,norm(name)),set()))>1:
-            can_code,can_name=canonical.get((group,norm(name)),(old,name))
-            if old!=can_code:
-                new_code=can_code; new_name=can_name; action='map_to_existing'; risk='needs_mapping'; confirmed='N'; reason='同一科目名称在不同年度使用多个编码，建议映射到较早年度编码，需人工确认'
+            new_code=''; action='needs_recode'; risk='high'; confirmed='N'; reason='同一账套组多年度中，同一个旧编码对应多个名称，必须保留年度和账套文件ID后由人工填写新编码'
         lengths=pref_lengths_from_row(r) or code_lengths([row_value(x,'old_code') for x in raw_rows if row_value(x,'ledger_group')==group])
         new_parent=parent_from_code(new_code,lengths) or row_value(r,'old_parent_code')
         row={**r,'旧科目编码':old,'旧科目名称':name,'新科目编码':new_code,'新科目名称':new_name,'处理动作':action,'是否确认':confirmed,'风险级别':risk,'new_code':new_code,'new_name':new_name,'new_parent_code':new_parent,'action':action,'confirmed':confirmed,'risk_level':risk,'reason':reason}
         out.append(row)
-    return out
+    return sorted(out,key=account_sort_key)
 
 def build_level_plan(mapping_rows,raw_rows,cfg):
     raw_by_file={}
@@ -895,11 +874,12 @@ def build_level_plan(mapping_rows,raw_rows,cfg):
 def build_standard_accounts(mapping_rows):
     seen={}; out=[]
     for m in mapping_rows:
+        if not row_value(m,'new_code'): continue
         key=(row_value(m,'ledger_group'),row_value(m,'new_code'),row_value(m,'new_name'))
         if key in seen: continue
         row={'账套组':key[0],'科目编码':key[1],'科目名称':key[2],'上级科目编码':row_value(m,'new_parent_code'),'ledger_group':key[0],'new_code':key[1],'new_name':key[2],'new_parent_code':row_value(m,'new_parent_code')}
         seen[key]=row; out.append(row)
-    return sorted(out,key=lambda r:(row_value(r,'ledger_group'),row_value(r,'new_code')))
+    return sorted(out,key=account_sort_key)
 
 def cmd_make_config(a):
     with open(a.out,'w',encoding='utf-8') as f: json.dump(DEFAULT_CONFIG,f,ensure_ascii=False,indent=2)
@@ -925,11 +905,13 @@ def cmd_scan_kis(a):
             pa=getattr(e,'audit',[])
             if pa: perf+=pa
             errs.append({'source_file':str(f),'source_file_id':source_file_id(f),'ledger_file':str(f),'stage':'connect_or_scan','error':str(e)})
+    accounts=sorted(accounts,key=account_sort_key)
     summary=dedupe_accounts(accounts)
     conflicts=build_conflicts(accounts,summary)
     maps=build_mapping_confirmation(accounts,summary,cfg)
     level_plan,level_conflicts=build_level_plan(maps,accounts,cfg)
     conflicts+=level_conflicts
+    conflicts=sorted(conflicts,key=account_sort_key)
     std=build_standard_accounts(maps)
     raw_cols=['账套文件','账套文件ID','公司名称','年度','原始科目编码','原始科目名称','父级编码','级次','来源表','编码字段','名称字段','source_file','source_file_id','company','year','old_code','old_name','old_parent_code','level','source_db_table','source_code_field','source_name_field','ledger_group','FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']
     summary_cols=['账套组','科目编码','科目名称','父级编码','出现年度','出现账套数','出现账套文件','ledger_group','old_code','old_name','old_parent_code']
