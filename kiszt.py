@@ -815,6 +815,54 @@ def cmd_apply(a):
     write_csv(out/('apply_audit_dryrun.csv' if a.dry_run else 'apply_audit_commit.csv'),audit)
     if skipped: write_csv(out/'skipped_unconfirmed_mapping.csv',skipped)
     print('完成。')
+def _is_frozen():
+    return getattr(sys,'frozen',False)
+
+def _pause_if_frozen(msg='按回车键关闭窗口...'):
+    if _is_frozen():
+        try: input('\n'+msg)
+        except Exception: pass
+
+def _interactive_menu():
+    """双击 exe 时无参数进入交互菜单，引导用户选择操作。"""
+    SEP='='*60
+    print(SEP)
+    print('  金蝶 KIS 多年账套科目标准化工具')
+    print(SEP)
+    print()
+    print('  请选择操作：')
+    print('  [1] scan-kis   扫描账套，生成映射草稿')
+    print('  [2] apply      将映射表写入账套副本（含试运行）')
+    print('  [3] make-config  生成配置文件模板')
+    print('  [Q] 退出')
+    print()
+    choice=input('  输入序号后按回车：').strip().upper()
+    if choice=='Q' or choice=='': return
+    if choice=='1':
+        src=input('  账套文件夹路径（含所有年份子目录）：').strip().strip('"')
+        out=input('  工作目录（输出 CSV 的位置）：').strip().strip('"')
+        sys.argv=['',  'scan-kis','--input',src,'--out',out]
+    elif choice=='2':
+        print()
+        print('  [1] 试运行 (dry-run) —— 只预检，不修改任何文件（推荐先做）')
+        print('  [2] 正式写入 (commit) —— 复制账套并写入')
+        mode=input('  选择模式：').strip()
+        mapping=input('  mapping_draft.csv 的完整路径：').strip().strip('"')
+        out=input('  输出副本目录（必须为空）：').strip().strip('"')
+        if mode=='2':
+            sys.argv=['','apply','--mapping',mapping,'--out',out,'--commit']
+        else:
+            sys.argv=['','apply','--mapping',mapping,'--out',out,'--dry-run']
+    elif choice=='3':
+        out=input('  config.json 输出完整路径：').strip().strip('"')
+        sys.argv=['','make-config','--out',out]
+    else:
+        print('  无效选项。')
+        _pause_if_frozen()
+        return
+    print()
+    main()
+
 def main():
     p=argparse.ArgumentParser(description='金蝶 KIS 多年账套科目标准化工具')
     sub=p.add_subparsers(dest='cmd',required=True)
@@ -823,4 +871,21 @@ def main():
     q=sub.add_parser('scan-kis'); q.add_argument('--input',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.set_defaults(func=cmd_scan_kis)
     q=sub.add_parser('apply'); q.add_argument('--mapping',required=True); q.add_argument('--out',required=True); q.add_argument('--config'); q.add_argument('--systemdb'); q.add_argument('--dry-run',action='store_true',default=True); q.add_argument('--commit',dest='dry_run',action='store_false'); q.add_argument('--allow-unconfirmed',action='store_true'); q.set_defaults(func=cmd_apply)
     a=p.parse_args(); a.func(a)
-if __name__=='__main__': main()
+
+if __name__=='__main__':
+    try:
+        # 双击 exe 或本地无参数运行时，进入交互菜单，避免窗口一闪而过
+        if len(sys.argv)<=1:
+            _interactive_menu()
+        else:
+            main()
+        _pause_if_frozen('完成。按回车键关闭窗口...')
+    except SystemExit as e:
+        # argparse / raise SystemExit(1) 等正常退出，打印提示后暂停
+        if e.code and e.code!=0:
+            _pause_if_frozen('出现错误，按回车键关闭窗口...')
+        sys.exit(e.code or 0)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _pause_if_frozen('出现未处理异常，按回车键关闭窗口...')
+        sys.exit(1)
