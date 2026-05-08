@@ -78,19 +78,51 @@ def ledger_group_name(file_path,company_name=''):
     return p.stem or '未命名账套组'
 
 def ledger_output_paths(out,sources,source_years=None):
-    out=Path(out); result={}; used=set(); source_years=source_years or {}
+    out=Path(out)/'处理后账套'; result={}; used=set(); source_years=source_years or {}
     for src in sorted([s for s in sources if s]):
         p=Path(src); yr=sql_value(source_years.get(src,'')) or year_of(src)
-        if yr and yr not in p.stem:
-            candidate=out/(p.stem+'_'+yr+p.suffix)
-        else:
-            candidate=out/p.name
+        prefix=yr or '未知年度'
+        candidate=out/('%s_%s'%(prefix,p.name))
         key=str(candidate).lower()
         if key in used:
             candidate=candidate.with_name(candidate.stem+'_'+short_path_id(src)+candidate.suffix)
             key=str(candidate).lower()
         used.add(key); result[src]=str(candidate)
     return result
+
+RESULT_SUMMARY_COLS=['原始账套路径','修改后账套路径','账套文件ID','公司名称','年度','是否生成副本','是否执行修改','修改科目数量','修改表数量','审计文件路径','处理状态','失败原因']
+
+def abs_path_text(path):
+    if not path: return ''
+    try: return str(Path(path).resolve())
+    except Exception: return str(path)
+
+def result_summary_row(src='',dst='',fid='',company='',year='',generated=False,executed=False,account_count=0,table_count=0,audit_path='',status='',reason=''):
+    return {'原始账套路径':abs_path_text(src),'修改后账套路径':abs_path_text(dst) if dst else '','账套文件ID':fid,'公司名称':company,'年度':year,'是否生成副本':yn(generated),'是否执行修改':yn(executed),'修改科目数量':account_count,'修改表数量':table_count,'审计文件路径':abs_path_text(audit_path) if audit_path else '','处理状态':status,'失败原因':reason}
+
+def source_meta_from_rows(src,rows,source_years=None):
+    source_years=source_years or {}
+    first=rows[0] if rows else {}
+    return row_value(first,'source_file_id') or source_file_id(src), row_value(first,'company','company_name','公司名称'), row_value(first,'year') or sql_value(source_years.get(src,'')) or year_of(src)
+
+def modified_table_count(audit_rows):
+    tables=set()
+    for r in audit_rows:
+        aff=sql_value(r.get('affected_rows',''))
+        try: affected=int(float(aff)) if aff else 0
+        except Exception: affected=0
+        if affected>0 and row_value(r,'table'): tables.add(row_value(r,'table'))
+    return len(tables)
+
+def blocking_reasons(rows,src=''):
+    out=[]
+    for r in rows:
+        rsrc=row_value(r,'source_file','file')
+        if src and rsrc and rsrc!=src: continue
+        if is_blocking(r):
+            reason=row_value(r,'reason','error','错误') or row_value(r,'action','check')
+            if reason and reason not in out: out.append(reason)
+    return out
 
 def write_csv(path,rows):
     path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
@@ -251,12 +283,20 @@ def cumulative_to_segments(lengths):
         out.append(n-prev); prev=n
     return out
 
-def pref_segments_from_row(row):
+def pref_raw_lengths_from_row(row):
     out=[]
     for k in ['FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']:
         v=sql_value(row.get(k,''))
         if v.isdigit() and int(v)>0: out.append(int(v))
     return out
+
+def pref_uses_cumulative_lengths(row):
+    raw=pref_raw_lengths_from_row(row)
+    return len(raw)>1 and all(raw[i]>raw[i-1] for i in range(1,len(raw)))
+
+def pref_segments_from_row(row):
+    raw=pref_raw_lengths_from_row(row)
+    return cumulative_to_segments(raw) if pref_uses_cumulative_lengths(row) else raw
 
 def level_rule_text(segments):
     return '-'.join(str(x) for x in segments if int(x)>0)
@@ -351,7 +391,8 @@ def normalize_mapping_row(r):
     return out
 
 def pref_lengths_from_row(row):
-    return segments_to_cumulative(pref_segments_from_row(row))
+    raw=pref_raw_lengths_from_row(row)
+    return raw if pref_uses_cumulative_lengths(row) else segments_to_cumulative(raw)
 
 def pref_values_from_row(row,prefix=''):
     return {prefix+k:sql_value(row.get(k,'')) for k in ['FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']}
@@ -373,7 +414,12 @@ class ApplyError(RuntimeError):
 
 class AccessDB:
     def __init__(self,cfg): self.cfg=cfg
-    def connect(self,file_path):
+    def read_copy_path(self,file_path):
+        td=tempfile.mkdtemp(prefix='kis_read_')
+        tmp=str(Path(td)/Path(file_path).name)
+        shutil.copy2(file_path,tmp)
+        return tmp,td
+    def connect(self,file_path,systemdb_hint=None):
         import pyodbc
         installed=list(pyodbc.drivers())
         cand=[]; installed_lower={str(d).lower():d for d in installed}
@@ -388,7 +434,7 @@ class AccessDB:
             try:
                 td=tempfile.mkdtemp(prefix='kis_ais_'); tmp=os.path.join(td,Path(file_path).name+'.mdb'); shutil.copy2(file_path,tmp); paths.append(tmp)
             except Exception: pass
-        systemdb=find_systemdb(self.cfg,file_path)
+        systemdb=find_systemdb(self.cfg,systemdb_hint or file_path)
         logins=access_login_options(self.cfg,systemdb)
         last=None; attempts=[]
         for p in paths:
@@ -535,11 +581,12 @@ class AccessDB:
         if not selects: return {}
         return self.one(conn,'SELECT '+','.join(selects)+' FROM [GLVch]')
     def scan_kis_file(self,file):
-        started=time.perf_counter(); conn=None; accounts=[]; aux=[]; errors=[]; touched=[]
+        started=time.perf_counter(); conn=None; read_tmp=None; accounts=[]; aux=[]; errors=[]; touched=[]
         fid=source_file_id(file)
         perf={'source_file':str(file),'source_file_id':fid,'ledger_file':str(file),'ledger_name':Path(file).stem,'scan_mode':'scan-kis','connected':'N','full_table_scan':'N','full_field_scan':'N','refs_called':'N','write_sql':'N','status':'error'}
         try:
-            conn=self.connect(str(file)); perf['connected']='Y'
+            read_path,read_tmp=self.read_copy_path(str(file))
+            conn=self.connect(read_path,str(file)); perf['connected']='Y'
             pref={}; pref_fields=[]
             pref_candidates=['FCompany','FStartYear','FStartPeriod','FCurrYear','FCurrPeriod','FNaturalStartYear','FAcLevels','FAcLen1','FAcLen2','FAcLen3','FAcLen4','FAcLen5','FAcLen6']
             if self.fast_table_exists(conn,'GLPref'):
@@ -597,6 +644,7 @@ class AccessDB:
             raise ApplyError(str(e),[perf]) from e
         finally:
             if conn: conn.close()
+            if read_tmp: shutil.rmtree(read_tmp,ignore_errors=True)
     def account_code_lengths(self,conn):
         try:
             r=self.account_level_pref(conn)
@@ -637,8 +685,8 @@ class AccessDB:
             audit.append(audit_row(table='GLPref',action='account_level_error',risk_level='error',reason=msg,planned_sql_type='UPDATE_GLPREF',dry_run=yn(dry),blocked_commit='Y'))
             if not dry: raise RuntimeError(msg)
             return audit
-        old_pref=self.account_level_pref(conn); old=current; old_segments=pref_segments_from_row(old_pref); padded=target_segments+[0]*(6-len(target_segments))
-        audit.append(audit_row(table='GLPref',action='account_level_plan',risk_level='info',reason='更新 GLPref 科目级次，确保支持后续目标编码',planned_sql_type='UPDATE_GLPREF',affected_rows=1 if old!=target else 0,dry_run=yn(dry),blocked_commit='N',old_FAcLevels=sql_value(old_pref.get('FAcLevels')),old_FAcLen1=sql_value(old_pref.get('FAcLen1')),old_FAcLen2=sql_value(old_pref.get('FAcLen2')),old_FAcLen3=sql_value(old_pref.get('FAcLen3')),old_FAcLen4=sql_value(old_pref.get('FAcLen4')),old_FAcLen5=sql_value(old_pref.get('FAcLen5')),old_FAcLen6=sql_value(old_pref.get('FAcLen6')),new_FAcLevels=len(target_segments),new_FAcLen1=padded[0],new_FAcLen2=padded[1],new_FAcLen3=padded[2],new_FAcLen4=padded[3],new_FAcLen5=padded[4],new_FAcLen6=padded[5],old_lengths=level_rule_text(old_segments),new_lengths=level_rule_text(target_segments),old_cumulative=','.join(map(str,old)),new_cumulative=','.join(map(str,target))))
+        old_pref=self.account_level_pref(conn); old=current; old_segments=pref_segments_from_row(old_pref); storage_values=target if pref_uses_cumulative_lengths(old_pref) else target_segments; padded=storage_values+[0]*(6-len(storage_values)); storage_mode='cumulative' if pref_uses_cumulative_lengths(old_pref) else 'segments'
+        audit.append(audit_row(table='GLPref',action='account_level_plan',risk_level='info',reason='更新 GLPref 科目级次，确保支持后续目标编码',planned_sql_type='UPDATE_GLPREF',affected_rows=1 if old!=target else 0,dry_run=yn(dry),blocked_commit='N',old_FAcLevels=sql_value(old_pref.get('FAcLevels')),old_FAcLen1=sql_value(old_pref.get('FAcLen1')),old_FAcLen2=sql_value(old_pref.get('FAcLen2')),old_FAcLen3=sql_value(old_pref.get('FAcLen3')),old_FAcLen4=sql_value(old_pref.get('FAcLen4')),old_FAcLen5=sql_value(old_pref.get('FAcLen5')),old_FAcLen6=sql_value(old_pref.get('FAcLen6')),new_FAcLevels=len(target_segments),new_FAcLen1=padded[0],new_FAcLen2=padded[1],new_FAcLen3=padded[2],new_FAcLen4=padded[3],new_FAcLen5=padded[4],new_FAcLen6=padded[5],old_lengths=level_rule_text(old_segments),new_lengths=level_rule_text(target_segments),old_cumulative=','.join(map(str,old)),new_cumulative=','.join(map(str,target)),glpref_storage_mode=storage_mode))
         if old==target: return audit
         if not dry:
             cur.execute('UPDATE [GLPref] SET [FAcLevels]=?, [FAcLen1]=?, [FAcLen2]=?, [FAcLen3]=?, [FAcLen4]=?, [FAcLen5]=?, [FAcLen6]=?',len(target_segments),padded[0],padded[1],padded[2],padded[3],padded[4],padded[5])
@@ -651,7 +699,7 @@ class AccessDB:
             out.append({'账套文件':str(file),'表名':t,'字段':cols,'是否科目表':'Y' if t==account_table else ''})
         return out
     def read_accounts(self,file):
-        conn=self.connect(str(file))
+        read_path,read_tmp=self.read_copy_path(str(file)); conn=self.connect(read_path,str(file))
         try:
             info=self.ledger_info(conn,file)
             code_lengths=self.account_code_lengths(conn)
@@ -667,7 +715,9 @@ class AccessDB:
                 out.append({**info,'account_table':table,'old_code':code,'old_name':name,'old_full_name':d.get(f.get('fullname') or '', ''),'old_parent_code':parent,'used_in_voucher':vc,'used_in_balance':bc})
             schema=self.schema_rows(conn,file,table)
             return out,schema
-        finally: conn.close()
+        finally:
+            conn.close()
+            shutil.rmtree(read_tmp,ignore_errors=True)
     def reference_fields(self,conn,account_table='',account_code_field='',source_file='',dry=True):
         refs=[]; report=[]; known=self.cfg.get('known_reference_fields',{})
         for t,fields in known.items():
@@ -705,7 +755,7 @@ class AccessDB:
         if blocked is None: blocked=risk in ('error','high')
         out.append(audit_row(source_file=row_value(row,'source_file','ledger_file'),source_file_id=row_value(row,'source_file_id'),year=row_value(row,'year'),old_code=sql_value(row.get('old_code','')),old_name=sql_value(row.get('old_name','')),new_code=sql_value(row.get('new_code','')),new_name=sql_value(row.get('new_name','')),action=sql_value(row.get('action','')),risk_level=risk,reason=reason,planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit=yn(blocked),check=check,confirmed=sql_value(row.get('confirmed','')),new_parent_code=sql_value(row.get('new_parent_code','')),**extra))
     def preflight_apply(self,src,dst,active_rows,all_rows,dry=True):
-        pre=[]; ref_report=[]
+        pre=[]; ref_report=[]; conn=None; read_tmp=None
         src_path=Path(src) if src else Path('')
         if not src:
             for r in all_rows: self.add_preflight(pre,r,'missing_source_file','error','ledger_file 为空，无法定位账套',dry)
@@ -738,7 +788,7 @@ class AccessDB:
                 for r in [x for x in all_rows if sql_value(x.get('new_code',''))==new]:
                     self.add_preflight(pre,r,'duplicate_new_code','error','同一账套内多个 old_code 指向同一个 new_code：%s'%(','.join(sorted(olds))),dry)
         try:
-            conn=self.connect(src)
+            read_path,read_tmp=self.read_copy_path(src); conn=self.connect(read_path,src)
             try:
                 info=self.ledger_info(conn,src); actual_fid=source_file_id(src); actual_year=row_value(info,'year')
                 table,f=self.account_table(conn); cf,nf=f['code'],f['name']; accounts=self.account_map(conn,table,cf,nf); final_codes=self.final_code_set(accounts,all_rows); lengths=code_lengths(final_codes); current_lengths=self.account_level_lengths(conn); target_lengths=sorted(set((current_lengths or [])+lengths)); target_segments=cumulative_to_segments(target_lengths); max_levels=int(self.cfg.get('max_account_levels',6) or 6)
@@ -766,17 +816,26 @@ class AccessDB:
                             if implied not in final_codes: self.add_preflight(pre,r,'account_level_gap','error','父子级次不连续，缺少上级编码 %s'%implied,dry)
                 if not pre:
                     pre.append(audit_row(source_file=src,action='preflight_ok',risk_level='info',reason='未发现阻止 commit 的问题',planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='N'))
-            finally: conn.close()
+            finally:
+                if conn: conn.close()
+                if read_tmp: shutil.rmtree(read_tmp,ignore_errors=True)
         except Exception as e:
+            if conn:
+                try: conn.close()
+                except Exception: pass
+            if read_tmp: shutil.rmtree(read_tmp,ignore_errors=True)
             pre.append(audit_row(source_file=src,action='preflight_connect_or_schema_error',risk_level='error',reason=str(e),planned_sql_type='PREFLIGHT',dry_run=yn(dry),blocked_commit='Y'))
         return pre,ref_report
     def apply(self,src,dst,maps,dry=True):
-        target=src if dry else dst; audit=[]; conn=None; copied=False
+        target=src if dry else dst; audit=[]; conn=None; copied=False; read_tmp=None
         try:
-            if not dry:
+            if dry:
+                target,read_tmp=self.read_copy_path(src)
+            else:
                 Path(dst).parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst); copied=True
-            conn=self.connect(target)
+            conn=self.connect(target,src)
             table,f=self.account_table(conn); cf,nf,pf=f['code'],f['name'],f.get('parent'); cur=conn.cursor(); refs=self.refs(conn,table,cf,src,dry); audit+=self.ensure_account_levels(conn,cur,maps,table,cf,dry)
+            if not dry: conn.commit()
             for row in audit:
                 if not row.get('source_file'): row['source_file']=src
             def update_refs(old,new,m):
@@ -788,41 +847,44 @@ class AccessDB:
                     except Exception as e:
                         audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=m.get('new_name',''),action='update_reference_error',risk_level='error',reason=str(e),planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='Y',file=src,error=str(e)))
                         if not dry: raise
+            def insert_account_clone(old,new,name,parent,m,action_name,reason):
+                cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),new); exists=int(cur.fetchone()[0] or 0)>0
+                cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
+                audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action=action_name,risk_level='info',reason=reason,planned_sql_type='INSERT_ACCOUNT',affected_rows=0 if exists else cnt,dry_run=yn(dry),blocked_commit='N',file=src,new_parent_code=parent))
+                if not dry and not exists and cnt:
+                    cols=self.cols(conn,table)
+                    cur.execute('SELECT '+','.join('[%s]'%x for x in cols)+' FROM [%s] WHERE [%s]=?'%(table,cf),old)
+                    src_row=cur.fetchone()
+                    if src_row is None: raise RuntimeError('旧科目不存在，无法创建新科目：%s'%old)
+                    vals=list(src_row)
+                    for idx,col in enumerate(cols):
+                        if col==cf: vals[idx]=new
+                        elif col==nf: vals[idx]=name
+                        elif pf and col==pf: vals[idx]=parent
+                    cur.execute('INSERT INTO [%s] (%s) VALUES (%s)'%(table,','.join('[%s]'%x for x in cols),','.join(['?']*len(cols))),vals)
+                return exists
             for m in maps:
                 old=m['old_code'].strip(); new=m['new_code'].strip(); name=m['new_name'].strip(); parent=m.get('new_parent_code','').strip(); action_type=sql_value(m.get('action','')).lower()
                 if not old or not new: continue
                 try:
                     cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),new); exists=int(cur.fetchone()[0] or 0)>0
                     if action_type=='create_year_dedicated_child':
-                        cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
-                        audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='insert_child_account',risk_level='info',reason='复制父科目行创建年度专用下级科目，父科目保留',planned_sql_type='INSERT_ACCOUNT',affected_rows=0 if exists else cnt,dry_run=yn(dry),blocked_commit='N',file=src,new_parent_code=parent))
-                        if not dry and not exists and cnt:
-                            cols=self.cols(conn,table)
-                            cur.execute('SELECT '+','.join('[%s]'%x for x in cols)+' FROM [%s] WHERE [%s]=?'%(table,cf),old)
-                            src_row=cur.fetchone()
-                            if src_row is None: raise RuntimeError('旧科目不存在，无法创建下级科目：%s'%old)
-                            vals=list(src_row)
-                            for idx,col in enumerate(cols):
-                                if col==cf: vals[idx]=new
-                                elif col==nf: vals[idx]=name
-                                elif pf and col==pf: vals[idx]=parent
-                            cur.execute('INSERT INTO [%s] (%s) VALUES (%s)'%(table,','.join('[%s]'%x for x in cols),','.join(['?']*len(cols))),vals)
+                        insert_account_clone(old,new,name,parent,m,'insert_child_account','复制父科目行创建年度专用下级科目，父科目保留')
                         if old!=new: update_refs(old,new,m)
+                        if not dry: conn.commit()
                         continue
-                    if old!=new: update_refs(old,new,m)
                     if old==new:
                         cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
                         audit.append(audit_row(source_file=src,table=table,field=nf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_account_name',risk_level='info',reason='更新科目名称',planned_sql_type='UPDATE_ACCOUNT_NAME',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src,code=old))
                         if not dry: cur.execute('UPDATE [%s] SET [%s]=? WHERE [%s]=?'%(table,nf,cf),name,old)
                     elif exists:
+                        update_refs(old,new,m)
                         audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='mapped_to_existing_target',risk_level='warning',reason='引用已改到目标科目，旧科目不自动删除',planned_sql_type='NO_ACCOUNT_UPDATE',affected_rows=0,dry_run=yn(dry),blocked_commit='N',file=src,note='引用已改到目标科目，旧科目不自动删除'))
                     else:
-                        cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
-                        audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='rename_account',risk_level='info',reason='更新科目编码和名称',planned_sql_type='UPDATE_ACCOUNT',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src))
-                        if not dry:
-                            sql='UPDATE [%s] SET [%s]=?, [%s]=?'%(table,cf,nf); vals=[new,name]
-                            if pf and parent: sql+=', [%s]=?'%pf; vals.append(parent)
-                            sql+=' WHERE [%s]=?'%cf; vals.append(old); cur.execute(sql,vals)
+                        insert_account_clone(old,new,name,parent,m,'insert_recode_account','复制旧科目行创建新编码科目，再更新白名单引用；旧科目保留以避免破坏未纳入白名单的关系')
+                        update_refs(old,new,m)
+                        audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='old_account_retained',risk_level='warning',reason='旧科目行暂不删除；如需清理，需确认所有非白名单关系表也已迁移',planned_sql_type='NO_DELETE',affected_rows=0,dry_run=yn(dry),blocked_commit='N',file=src))
+                    if not dry: conn.commit()
                 except Exception as e:
                     audit.append(audit_row(source_file=src,table=table,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='account_error',risk_level='error',reason=str(e),planned_sql_type='UPDATE_ACCOUNT',dry_run=yn(dry),blocked_commit='Y',file=src,error=str(e)))
                     if not dry: raise
@@ -831,6 +893,9 @@ class AccessDB:
             if conn:
                 try: conn.rollback()
                 except Exception: pass
+                try: conn.close()
+                except Exception: pass
+                conn=None
             if not dry and copied:
                 try:
                     if Path(dst).exists() and Path(dst).resolve()!=Path(src).resolve(): Path(dst).unlink()
@@ -838,6 +903,7 @@ class AccessDB:
             raise ApplyError(str(e),audit) from e
         finally:
             if conn: conn.close()
+            if read_tmp: shutil.rmtree(read_tmp,ignore_errors=True)
 
 def norm(s): return re.sub(r'\s+','',(s or '').strip())
 def next_code(existing,base,parent='',width=2):
@@ -977,7 +1043,7 @@ def build_level_plan(mapping_rows,raw_rows,cfg):
     max_levels=int(cfg.get('max_account_levels',6) or 6); out=[]; conflicts=[]
     for fid,rows in by_file.items():
         raw=raw_by_file.get(fid,rows[0]); codes=sorted(set(row_value(r,'new_code') for r in rows if row_value(r,'new_code'))); existing_codes=sorted(set(row_value(r,'old_code') for r in raw_rows_by_file.get(fid,[]) if row_value(r,'old_code')))
-        lengths=code_lengths(codes); cur=pref_lengths_from_row(raw); cur_segments=pref_segments_from_row(raw); target_lengths=sorted(set((cur or [])+lengths)); target_segments=cumulative_to_segments(target_lengths); target=target_segments+[0]*(6-len(target_segments))
+        lengths=code_lengths(codes); cur=pref_lengths_from_row(raw); cur_segments=pref_segments_from_row(raw); target_lengths=sorted(set((cur or [])+lengths)); target_segments=cumulative_to_segments(target_lengths); target_storage=target_lengths if pref_uses_cumulative_lengths(raw) else target_segments; target=target_storage+[0]*(6-len(target_storage))
         risk='info'; reason='当前科目级次已支持目标编码'; need='N'
         missing=missing_parent_codes(existing_codes+codes,target_lengths)
         if len(target_segments)>max_levels:
@@ -1062,12 +1128,12 @@ def cmd_scan_kis(a):
     write_csv_columns(out/'07_账套修改审计.csv',[],['source_file','source_file_id','year','table','field','old_code','new_code','action','risk_level','reason','affected_rows','dry_run','blocked_commit'])
     print('完成，输出目录：',out)
 def cmd_apply(a):
-    cfg=load_config_for_args(a); db=AccessDB(cfg); rows=[normalize_mapping_row(r) for r in read_csv(a.mapping)]; by=defaultdict(list); all_by=defaultdict(list); skipped=[]; out=Path(a.out); audit=[]; preflight=[]; ref_report=[]
+    cfg=load_config_for_args(a); db=AccessDB(cfg); rows=[normalize_mapping_row(r) for r in read_csv(a.mapping)]; by=defaultdict(list); all_by=defaultdict(list); skipped=[]; out=Path(a.out); audit=[]; preflight=[]; ref_report=[]; result_rows=[]
     cfg['_target_account_lengths']=[]
     for r in rows:
         src=row_value(r,'source_file','ledger_file')
-        if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         all_by[src].append(r)
+        if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         by[src].append(r)
     source_years={}
     for src,items in all_by.items():
@@ -1075,35 +1141,151 @@ def cmd_apply(a):
             y=sql_value(r.get('year',''))
             if y:
                 source_years[src]=y; break
-    dst_by=ledger_output_paths(out,[s for s in all_by.keys() if s],source_years)
-    for src,all_rows in all_by.items():
+    dst_by=ledger_output_paths(out,[s for s in by.keys() if s],source_years)
+    result_file=out/'00_处理结果汇总.csv'; audit_file=out/('apply_audit_dryrun.csv' if a.dry_run else 'apply_audit_commit.csv'); public_audit_file=out/'09_账套修改审计.csv'
+    skipped_sources={src:items for src,items in all_by.items() if not by.get(src)}
+    for src,items in skipped_sources.items():
+        fid,company,year=source_meta_from_rows(src,items,source_years)
+        result_rows.append(result_summary_row(src=src,fid=fid,company=company,year=year,status='跳过',reason='没有 confirmed=Y 的修改行'))
+    if a.dry_run:
+        print('当前是 dry-run，不会生成修改后的账套文件。')
+    if not by:
+        print('没有确认的修改行，因此不会生成修改后的账套。')
+        write_csv(out/'preflight_report.csv',preflight); write_csv(out/'reference_fields_report.csv',ref_report)
+        write_csv_columns(result_file,result_rows,RESULT_SUMMARY_COLS)
+        if skipped: write_csv(out/'skipped_unconfirmed_mapping.csv',skipped)
+        print('本次实际修改的账套数量：0')
+        print('本次跳过的账套数量：%s'%len(skipped_sources))
+        if skipped_sources:
+            print('跳过原因：')
+            for src in sorted(skipped_sources):
+                print(' - %s：没有 confirmed=Y 的修改行'%abs_path_text(src))
+        else:
+            print('跳过原因：无')
+        print('未生成修改后的账套文件。')
+        return
+    if not a.dry_run:
+        print('apply --commit 开始。')
+        for src in sorted(by.keys()):
+            dst=dst_by.get(src,'')
+            print('原始账套路径：%s'%abs_path_text(src))
+            print('输出目录：%s'%abs_path_text(out))
+            print('将要生成的副本路径：%s'%abs_path_text(dst))
+    for src,active_rows in by.items():
         dst=dst_by.get(src,'') if src else ''
-        pf,rr=db.preflight_apply(src,dst,by.get(src,[]),all_rows,a.dry_run); preflight+=pf; ref_report+=rr
+        pf,rr=db.preflight_apply(src,dst,active_rows,active_rows,a.dry_run); preflight+=pf; ref_report+=rr
     write_csv(out/'preflight_report.csv',preflight); write_csv(out/'reference_fields_report.csv',ref_report)
     blocked=[r for r in preflight+ref_report if is_blocking(r)]
     if blocked and not a.dry_run:
+        for src,active_rows in by.items():
+            fid,company,year=source_meta_from_rows(src,active_rows,source_years); dst=dst_by.get(src,''); reasons=blocking_reasons(preflight+ref_report,src)
+            result_rows.append(result_summary_row(src=src,dst=dst,fid=fid,company=company,year=year,audit_path=public_audit_file,status='preflight阻止',reason='；'.join(reasons[:8]) or 'preflight_report.csv 或 reference_fields_report.csv 存在阻断项'))
         audit.append(audit_row(action='commit_blocked',risk_level='error',reason='preflight_report.csv 或 reference_fields_report.csv 存在阻断项，未复制/未写入账套',planned_sql_type='NONE',dry_run='N',blocked_commit='Y',affected_rows=0,blocked_count=len(blocked)))
-        write_csv(out/'apply_audit_commit.csv',audit)
-        write_csv(out/'09_账套修改审计.csv',audit)
+        write_csv(audit_file,audit)
+        write_csv(public_audit_file,audit)
+        write_csv_columns(result_file,result_rows,RESULT_SUMMARY_COLS)
         if skipped: write_csv(out/'skipped_unconfirmed_mapping.csv',skipped)
-        print('commit 已阻止：请先查看 preflight_report.csv 和 reference_fields_report.csv')
+        print('commit 已阻止：preflight_report.csv 或 reference_fields_report.csv 存在阻断项。')
+        print('阻止原因：')
+        for reason in blocking_reasons(blocked)[:20]: print(' - '+reason)
+        print('修改审计文件完整路径：%s'%abs_path_text(public_audit_file))
+        print('处理结果汇总文件完整路径：%s'%abs_path_text(result_file))
+        print('本次实际修改的账套数量：0')
+        print('本次跳过的账套数量：%s'%len(skipped_sources))
+        if skipped_sources:
+            print('跳过原因：')
+            for src in sorted(skipped_sources): print(' - %s：没有 confirmed=Y 的修改行'%abs_path_text(src))
+        else:
+            print('跳过原因：无')
+        print('未生成修改后的账套文件。')
         raise SystemExit(1)
     for src,maps in by.items():
         if not src: continue
         print(('试运行 ' if a.dry_run else '写入副本 ')+src)
-        try: audit+=db.apply(src,dst_by.get(src,str(out/Path(src).name)),maps,a.dry_run)
+        dst=dst_by.get(src,str(out/'处理后账套'/('%s_%s'%(source_years.get(src,'未知年度'),Path(src).name))))
+        ledger_audit=[]
+        try:
+            ledger_audit=db.apply(src,dst,maps,a.dry_run); audit+=ledger_audit
+            fid,company,year=source_meta_from_rows(src,maps,source_years); reasons=blocking_reasons(preflight+ref_report,src)
+            status='dry-run完成（存在阻断项）' if a.dry_run and reasons else ('dry-run完成' if a.dry_run else '成功')
+            result_rows.append(result_summary_row(src=src,dst=dst,fid=fid,company=company,year=year,generated=(not a.dry_run and Path(dst).exists()),executed=(not a.dry_run),account_count=(0 if a.dry_run else len({(row_value(m,'old_code'),row_value(m,'new_code')) for m in maps if row_value(m,'old_code') and row_value(m,'new_code')})),table_count=(0 if a.dry_run else modified_table_count(ledger_audit)),audit_path=public_audit_file,status=status,reason='；'.join(reasons[:8]) if reasons else ''))
         except Exception as e:
             audit+=getattr(e,'audit',[])
-            audit.append(audit_row(source_file=src,action='apply_error',risk_level='error',reason=str(e),planned_sql_type='APPLY',dry_run=yn(a.dry_run),blocked_commit='Y',file=src,error=str(e)))
             if not a.dry_run:
-                write_csv(out/'apply_audit_commit.csv',audit)
-                write_csv(out/'09_账套修改审计.csv',audit)
+                first_error=str(e)
+                audit.append(audit_row(source_file=src,action='apply_retry',risk_level='warning',reason='本账套首次写入失败，已 rollback 并重试一次：%s'%first_error,planned_sql_type='APPLY',dry_run='N',blocked_commit='N',file=src,error=first_error))
+                print('本账套首次写入失败，已 rollback，重试一次：',first_error)
+                try:
+                    ledger_audit=db.apply(src,dst,maps,a.dry_run); audit+=ledger_audit
+                    fid,company,year=source_meta_from_rows(src,maps,source_years)
+                    result_rows.append(result_summary_row(src=src,dst=dst,fid=fid,company=company,year=year,generated=Path(dst).exists(),executed=True,account_count=len({(row_value(m,'old_code'),row_value(m,'new_code')) for m in maps if row_value(m,'old_code') and row_value(m,'new_code')}),table_count=modified_table_count(ledger_audit),audit_path=public_audit_file,status='成功（重试）',reason=first_error))
+                    continue
+                except Exception as retry_error:
+                    audit+=getattr(retry_error,'audit',[])
+                    e=retry_error
+            audit.append(audit_row(source_file=src,action='apply_error',risk_level='error',reason=str(e),planned_sql_type='APPLY',dry_run=yn(a.dry_run),blocked_commit='Y',file=src,error=str(e)))
+            fid,company,year=source_meta_from_rows(src,maps,source_years)
+            failed_dst=dst; fail_reason=str(e)
+            if not a.dry_run:
+                failed_dst=''
+                if dst and Path(dst).exists():
+                    try:
+                        if Path(dst).resolve()!=Path(src).resolve():
+                            Path(dst).unlink()
+                            fail_reason+='；失败副本已删除'
+                    except Exception as cleanup_error:
+                        failed_dst=dst
+                        fail_reason+='；失败副本清理失败：%s'%cleanup_error
+                        audit.append(audit_row(source_file=src,action='cleanup_failed_copy_error',risk_level='error',reason=str(cleanup_error),planned_sql_type='CLEANUP',dry_run='N',blocked_commit='Y',file=dst,error=str(cleanup_error)))
+            result_rows.append(result_summary_row(src=src,dst=failed_dst,fid=fid,company=company,year=year,generated=(not a.dry_run and bool(failed_dst) and Path(failed_dst).exists()),executed=False,account_count=0,table_count=0,audit_path=public_audit_file,status='失败',reason=fail_reason))
+            if not a.dry_run:
+                write_csv(audit_file,audit)
+                write_csv(public_audit_file,audit)
+                write_csv_columns(result_file,result_rows,RESULT_SUMMARY_COLS)
                 if skipped: write_csv(out/'skipped_unconfirmed_mapping.csv',skipped)
-                print('commit 写入失败，已 rollback：',e)
-                raise SystemExit(1)
-    write_csv(out/('apply_audit_dryrun.csv' if a.dry_run else 'apply_audit_commit.csv'),audit)
-    write_csv(out/'09_账套修改审计.csv',audit)
+                print('本账套写入失败，已 rollback，继续处理下一个账套：',e)
+                print('修改审计文件完整路径：%s'%abs_path_text(public_audit_file))
+                print('处理结果汇总文件完整路径：%s'%abs_path_text(result_file))
+                print('本次实际修改的账套数量：%s'%len([r for r in result_rows if str(r.get('处理状态','')).startswith('成功')]))
+                print('本次跳过的账套数量：%s'%len(skipped_sources))
+                if skipped_sources:
+                    print('跳过原因：')
+                    for s in sorted(skipped_sources): print(' - %s：没有 confirmed=Y 的修改行'%abs_path_text(s))
+                else:
+                    print('跳过原因：无')
+                if not any(r.get('是否生成副本')=='Y' for r in result_rows): print('未生成修改后的账套文件。')
+                continue
+    write_csv(audit_file,audit)
+    write_csv(public_audit_file,audit)
+    write_csv_columns(result_file,result_rows,RESULT_SUMMARY_COLS)
     if skipped: write_csv(out/'skipped_unconfirmed_mapping.csv',skipped)
+    if not a.dry_run:
+        success_rows=[r for r in result_rows if str(r.get('处理状态','')).startswith('成功')]
+        for r in success_rows: print('修改后的账套文件完整路径：%s'%r.get('修改后账套路径',''))
+        print('修改审计文件完整路径：%s'%abs_path_text(public_audit_file))
+        print('本次实际修改的账套数量：%s'%len(success_rows))
+        print('本次跳过的账套数量：%s'%len(skipped_sources))
+        if skipped_sources:
+            print('跳过原因：')
+            for src in sorted(skipped_sources): print(' - %s：没有 confirmed=Y 的修改行'%abs_path_text(src))
+        else:
+            print('跳过原因：无')
+    else:
+        print('处理结果汇总文件完整路径：%s'%abs_path_text(result_file))
+        print('本次实际修改的账套数量：0')
+        print('本次跳过的账套数量：%s'%len(skipped_sources))
+        if skipped_sources:
+            print('跳过原因：')
+            for src in sorted(skipped_sources): print(' - %s：没有 confirmed=Y 的修改行'%abs_path_text(src))
+        else:
+            print('跳过原因：无')
+    if not any(r.get('是否生成副本')=='Y' for r in result_rows): print('未生成修改后的账套文件。')
+    failed_rows=[r for r in result_rows if r.get('处理状态')=='失败']
+    if failed_rows:
+        print('失败账套数量：%s'%len(failed_rows))
+        for r in failed_rows[:20]: print(' - %s：%s'%(r.get('原始账套路径',''),r.get('失败原因','')))
+        print('完成（部分失败）。')
+        if not a.dry_run: raise SystemExit(1)
     print('完成。')
 def _is_frozen():
     return getattr(sys,'frozen',False)
@@ -1257,7 +1439,7 @@ def _launch_gui():
             code.pack(fill='x',padx=24,pady=6)
             code.insert('end','账套原始文件/\n  ├── 2021/\n  │   ├── 示例账套A.Ais\n  │   └── 示例账套B.Ais\n  ├── 2022/\n  │   └── 示例账套A.Ais\n  └── 2023/\n      └── 示例账套A.Ais')
             code.config(state='disabled')
-            info_box(inner,'输出副本目录需提前建好，且必须为空。副本文件名会在需要时自动加年份，例如：示例账套A_2021.Ais、示例账套A_2022.Ais …')
+            info_box(inner,'输出副本目录需提前建好。正式处理后的账套会统一放到“输出副本目录/处理后账套/”，文件名格式为：年度_原账套文件名，例如：2021_示例账套A.Ais。')
             btn_next.config(text='下一步 →',command=lambda:go_step(2))
 
         elif s==2:
@@ -1339,7 +1521,7 @@ def _launch_gui():
             sep(inner)
             entry_row(inner,'02_需要人工确认的科目重编码表.csv',v_map,browse_file=True)
             entry_row(inner,'输出副本目录',v_out,browse_dir=True)
-            info_box(inner,'输出目录必须为空，否则预检会报"同名副本已存在"错误。')
+            info_box(inner,'正式副本会生成到“输出副本目录/处理后账套/”。如果同名副本已存在，预检会阻止覆盖。')
             sep(inner)
             log_f2=tk.Frame(inner,bg=WHITE); log_f2.pack(fill='x',padx=24)
             log_widget=scrolledtext.ScrolledText(log_f2,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=7,state='disabled',wrap='word',relief='flat',bd=0)
@@ -1366,9 +1548,9 @@ def _launch_gui():
 
         elif s==5:
             lbl(inner,'正式写入',13,True,pady=4)
-            lbl(inner,'工具会先把源账套复制到输出目录，再在副本上修改，原始文件完全不动。',color=MUTED,wrap=600)
+            lbl(inner,'工具会先把源账套复制到输出目录下的“处理后账套”子目录，再在副本上修改，原始文件完全不动。',color=MUTED,wrap=600)
             sep(inner)
-            info_box(inner,'⚠  写入前请确认：① 预检无阻断项（preflight_report.csv 无 blocked_commit=Y）② 输出目录为空','warn')
+            info_box(inner,'⚠  写入前请确认：① 预检无阻断项（preflight_report.csv 无 blocked_commit=Y）② 处理后账套子目录没有同名副本','warn')
             sep(inner)
             log_f3=tk.Frame(inner,bg=WHITE); log_f3.pack(fill='x',padx=24)
             log_widget=scrolledtext.ScrolledText(log_f3,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=8,state='disabled',wrap='word',relief='flat',bd=0)
@@ -1394,7 +1576,7 @@ def _launch_gui():
                             def open_out():
                                 p=Path(v_out.get())
                                 if p.exists(): os.startfile(str(p))
-                            messagebox.showinfo('写入完成','副本已生成，点击确定打开输出目录。')
+                            messagebox.showinfo('写入完成','处理结果已生成。账套副本在输出目录的“处理后账套”子目录中，点击确定打开输出目录。')
                             open_out()
                     root.after(0,done)
                 _run_in_thread(run)

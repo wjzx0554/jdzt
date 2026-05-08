@@ -32,6 +32,7 @@
 4. 在 `02_需要人工确认的科目重编码表.csv` 中复核自动生成的新编码和新名称，确认后把 `confirmed` 或 `是否确认` 填为 `Y`。
 5. 先运行 dry-run，确认 `preflight_report.csv` 和 `09_账套修改审计.csv` 没有阻断项。
 6. 最后再 commit，工具会复制账套副本并只修改副本。
+7. commit 成功后，在 `输出目录/处理后账套/` 查看修改后的账套文件。
 
 普通科目不会进入人工确认表，也不会在 apply 时被修改。
 
@@ -194,6 +195,7 @@ GLPref 中的默认科目字段
 apply 输出目录会生成：
 
 ```text
+00_处理结果汇总.csv
 preflight_report.csv
 reference_fields_report.csv
 apply_audit_dryrun.csv
@@ -202,10 +204,31 @@ apply_audit_commit.csv
 skipped_unconfirmed_mapping.csv
 ```
 
+- `00_处理结果汇总.csv`：每个账套是否生成副本、是否执行修改、修改后账套完整路径、失败原因。
 - `preflight_report.csv`：写库前校验结果。
 - `reference_fields_report.csv`：本次允许更新的白名单引用字段。
 - `09_账套修改审计.csv`：dry-run 或 commit 的汇总审计。
 - `skipped_unconfirmed_mapping.csv`：未确认、被跳过的人工确认行。
+
+正式生成的账套统一放在：
+
+```text
+输出目录/处理后账套/
+```
+
+文件名格式：
+
+```text
+年度_原账套文件名
+```
+
+例如：
+
+```text
+输出目录/处理后账套/2001_示例账套.Ais
+```
+
+如果本次没有任何 `confirmed=Y` 的修改行，或 commit 被 preflight 阻止，工具会明确打印“未生成修改后的账套文件”，并在 `00_处理结果汇总.csv` 写明原因。
 
 ## 老账套环境
 

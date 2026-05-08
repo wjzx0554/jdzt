@@ -58,7 +58,7 @@ class App(tk.Tk):
         ttk.Label(root, text=APP_TITLE, font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
         ttk.Label(
             root,
-            text='按步骤处理老 AIS 账套：先快速扫描关键 KIS 表，在软件里查看科目汇总和人工确认表，确认后再试运行和生成副本。',
+            text='按步骤处理老 AIS 账套：先快速扫描关键 KIS 表，在软件里查看科目汇总和人工确认表，确认后再试运行和生成副本。正式副本会放在输出目录的“处理后账套”子目录。',
             wraplength=1100,
         ).pack(anchor='w', pady=(4, 12))
 
@@ -66,7 +66,7 @@ class App(tk.Tk):
         paths.pack(fill=tk.X)
         self.row(paths, 0, '原始账套目录', self.input_dir, 'dir')
         self.row(paths, 1, '扫描/映射输出目录', self.work_dir, 'dir')
-        self.row(paths, 2, '处理后副本目录', self.output_dir, 'dir')
+        self.row(paths, 2, '处理结果输出目录', self.output_dir, 'dir')
         self.row(paths, 3, '配置文件 config.json', self.config_file, 'save')
         self.row(paths, 4, '科目映射 CSV', self.mapping_file, 'file')
         ttk.Label(
@@ -88,7 +88,7 @@ class App(tk.Tk):
         tools.pack(fill=tk.X, pady=(0, 8))
         ttk.Checkbutton(tools, text='允许处理未确认映射，不建议勾选', variable=self.allow_unconfirmed).pack(side=tk.LEFT)
         self.add_button(tools, '打开扫描目录', self.open_work_dir).pack(side=tk.RIGHT, padx=(8, 0))
-        self.add_button(tools, '打开副本目录', self.open_output_dir).pack(side=tk.RIGHT, padx=(8, 0))
+        self.add_button(tools, '打开处理结果目录', self.open_output_dir).pack(side=tk.RIGHT, padx=(8, 0))
         self.add_button(tools, '旧版全量分析', self.inspect).pack(side=tk.RIGHT, padx=(8, 0))
 
         body = ttk.PanedWindow(root, orient=tk.VERTICAL)
@@ -108,6 +108,7 @@ class App(tk.Tk):
             '扫描性能',
             '预检报告',
             '引用字段',
+            '处理结果',
             '试运行审计',
             '正式审计',
         ]:
@@ -297,7 +298,7 @@ class App(tk.Tk):
             argv += ['--allow-unconfirmed']
 
         def done():
-            self.status_text.set('试运行完成。请查看“预检报告”“引用字段”“试运行审计”，没有阻断项再正式生成副本。')
+            self.status_text.set('试运行完成。请查看“预检报告”“引用字段”“处理结果”“试运行审计”，没有阻断项再正式生成副本。')
             self.refresh_previews()
 
         self.run_core(argv, '试运行完成。', done)
@@ -325,7 +326,7 @@ class App(tk.Tk):
             argv += ['--allow-unconfirmed']
 
         def done():
-            self.status_text.set('正式处理完成。请查看“正式审计”和副本目录。')
+            self.status_text.set('正式处理完成。请查看“处理结果”“正式审计”，账套副本在输出目录的“处理后账套”子目录。')
             self.refresh_previews()
 
         self.run_core(argv, '正式处理完成。', done)
@@ -343,6 +344,7 @@ class App(tk.Tk):
             '扫描性能': work / '06_扫描性能统计.csv' if work else None,
             '预检报告': out / 'preflight_report.csv' if out else None,
             '引用字段': out / 'reference_fields_report.csv' if out else None,
+            '处理结果': out / '00_处理结果汇总.csv' if out else None,
             '试运行审计': out / '09_账套修改审计.csv' if out else None,
             '正式审计': out / '09_账套修改审计.csv' if out else None,
         }
