@@ -48,6 +48,11 @@ jobs:
         run: |
           pyinstaller --clean --noconfirm --onefile --console --name KIS_MultiYear_Standardizer_CLI_${{ matrix.suffix }} --hidden-import pyodbc kis_multi_year_account_standardizer.py
 
+      - name: Build KISZT EXE
+        shell: cmd
+        run: |
+          pyinstaller --clean --noconfirm --onefile --console --name KISZT_${{ matrix.suffix }} --hidden-import pyodbc kiszt.py
+
       - name: Prepare release folder
         shell: cmd
         run: |

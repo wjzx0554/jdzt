@@ -72,14 +72,15 @@ def ledger_group_name(file_path,company_name=''):
         if cleaned: return cleaned
     return p.stem or '未命名账套组'
 
-def ledger_output_paths(out,sources,source_years=None):
-    out=Path(out); result={}; used=set(); source_years=source_years or {}
+def ledger_output_paths(out,sources):
+    # 所有副本输出文件名统一追加年份后缀，便于同一目录下按账套名称排序后对比多年数据
+    # 例如：上马村_2001.Ais、上马村_2002.Ais（即使只有一年也加年份，保持命名一致）
+    # 无法识别年份时原名输出，若再重名则追加 hash 去重
+    out=Path(out); result={}; used=set()
     for src in sorted([s for s in sources if s]):
-        p=Path(src); yr=sql_value(source_years.get(src,'')) or year_of(src)
-        if yr and yr not in p.stem:
-            candidate=out/(p.stem+'_'+yr+p.suffix)
-        else:
-            candidate=out/p.name
+        p=Path(src)
+        yr=year_of(src)
+        candidate=out/(p.stem+'_'+yr+p.suffix) if yr else out/p.name
         key=str(candidate).lower()
         if key in used:
             candidate=candidate.with_name(candidate.stem+'_'+short_path_id(src)+candidate.suffix)
@@ -580,7 +581,8 @@ class AccessDB:
             if not sql_value(r.get('new_code','')): self.add_preflight(pre,r,'missing_new_code','error','new_code 为空',dry)
             if sql_value(r.get('confirmed','')).upper()!='Y': self.add_preflight(pre,r,'unconfirmed_mapping','error','confirmed != Y，commit 默认阻止',dry)
             if sql_value(r.get('action','')).lower()=='create_year_dedicated_child':
-                self.add_preflight(pre,r,'unsupported_create_year_dedicated_child','error','当前实现只是重编码，不会 INSERT 创建新子科目；commit 必须阻止',dry)
+                # apply 会复制父科目行 INSERT 子科目，再把凭证引用从旧编码改到新编码，父科目行保留
+                self.add_preflight(pre,r,'create_year_dedicated_child_plan','info','将 INSERT 新子科目并把引用迁移至该子科目，父科目行保留',dry,blocked=False)
         by_new=defaultdict(set)
         for r in all_rows:
             new=sql_value(r.get('new_code','')); old=sql_value(r.get('old_code',''))
@@ -605,7 +607,8 @@ class AccessDB:
                     old=sql_value(r.get('old_code','')); new=sql_value(r.get('new_code','')); parent=sql_value(r.get('new_parent_code','')); action=sql_value(r.get('action','')).lower()
                     if old and old not in accounts: self.add_preflight(pre,r,'old_code_missing','error','old_code 在账套科目表中不存在',dry)
                     if new and new in accounts and old!=new and action not in MERGE_ACTIONS: self.add_preflight(pre,r,'new_code_exists_without_merge_action','error','new_code 已存在，但 action 不是明确合并策略',dry)
-                    if new and new in accounts and old!=new and action in MERGE_ACTIONS: self.add_preflight(pre,r,'merge_requires_usage_check','error','多个旧科目映射到同一个已存在新科目时，需要先校验余额/凭证是否要合并；当前不会静默 UPDATE',dry)
+                    # 合并动作：apply 会把 old 的引用改到 new，旧科目行保留不删除；人工确认(confirmed=Y)后允许 commit
+                    if new and new in accounts and old!=new and action in MERGE_ACTIONS: self.add_preflight(pre,r,'merge_requires_usage_check','warning','多个旧科目映射到同一已存在编码；引用字段将更新至目标编码，旧科目行保留，余额合并需事后手工核对',dry,blocked=False)
                     if parent and parent not in final_codes: self.add_preflight(pre,r,'new_parent_missing','error','new_parent_code 在最终科目集合中不存在',dry)
                     if parent and new and not new.startswith(parent): self.add_preflight(pre,r,'parent_prefix_mismatch','error','new_code 不是 new_parent_code 的下级前缀',dry)
                     if new and len(lengths)<=max_levels:
@@ -640,9 +643,25 @@ class AccessDB:
                         except Exception as e:
                             audit.append(audit_row(source_file=src,table=t,field=c,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_reference_error',risk_level='error',reason=str(e),planned_sql_type='UPDATE_REFERENCE',dry_run=yn(dry),blocked_commit='Y',file=src,error=str(e)))
                             if not dry: raise
+                action_type=sql_value(m.get('action','')).lower()
                 try:
                     cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),new); exists=int(cur.fetchone()[0] or 0)>0
-                    if old==new:
+                    if action_type=='create_year_dedicated_child' and not exists:
+                        # 复制父科目行，改编码和名称，INSERT 新子科目；父科目行保留不修改
+                        cur.execute('SELECT * FROM [%s] WHERE [%s]=?'%(table,cf),old); row_data=cur.fetchone()
+                        cols=[d[0] for d in cur.description] if cur.description else []
+                        cnt_old=1 if row_data else 0
+                        audit.append(audit_row(source_file=src,table=table,field=cf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='insert_year_dedicated_child',risk_level='info',reason='复制父科目行并 INSERT 新子科目，凭证引用将迁移',planned_sql_type='INSERT_ACCOUNT',affected_rows=cnt_old,dry_run=yn(dry),blocked_commit='N',file=src))
+                        if not dry and row_data and cols:
+                            vals=list(row_data)
+                            for i,c in enumerate(cols):
+                                if c==cf: vals[i]=new
+                                elif c==nf: vals[i]=name
+                                elif pf and c==pf: vals[i]=parent or old
+                            ph=','.join(['?']*len(cols))
+                            col_str=','.join('[%s]'%c for c in cols)
+                            cur.execute('INSERT INTO [%s] (%s) VALUES (%s)'%(table,col_str,ph),vals)
+                    elif old==new:
                         cur.execute('SELECT COUNT(*) FROM [%s] WHERE [%s]=?'%(table,cf),old); cnt=int(cur.fetchone()[0] or 0)
                         audit.append(audit_row(source_file=src,table=table,field=nf,old_code=old,old_name=m.get('old_name',''),new_code=new,new_name=name,action='update_account_name',risk_level='info',reason='更新科目名称',planned_sql_type='UPDATE_ACCOUNT_NAME',affected_rows=cnt,dry_run=yn(dry),blocked_commit='N',file=src,code=old))
                         if not dry: cur.execute('UPDATE [%s] SET [%s]=? WHERE [%s]=?'%(table,nf,cf),name,old)
@@ -769,13 +788,7 @@ def cmd_apply(a):
         src=sql_value(r.get('ledger_file','')); all_by[src].append(r)
         if not a.allow_unconfirmed and str(r.get('confirmed','')).upper()!='Y': skipped.append(r); continue
         by[src].append(r)
-    source_years={}
-    for src,items in all_by.items():
-        for r in items:
-            y=sql_value(r.get('year',''))
-            if y:
-                source_years[src]=y; break
-    dst_by=ledger_output_paths(out,[s for s in all_by.keys() if s],source_years)
+    dst_by=ledger_output_paths(out,[s for s in all_by.keys() if s])
     for src,all_rows in all_by.items():
         dst=dst_by.get(src,'') if src else ''
         pf,rr=db.preflight_apply(src,dst,by.get(src,[]),all_rows,a.dry_run); preflight+=pf; ref_report+=rr
