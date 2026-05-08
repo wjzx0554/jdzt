@@ -823,8 +823,290 @@ def _pause_if_frozen(msg='按回车键关闭窗口...'):
         try: input('\n'+msg)
         except Exception: pass
 
-def _interactive_menu():
-    """双击 exe 时无参数进入交互菜单，引导用户选择操作。"""
+def _run_in_thread(target,args=()):
+    import threading
+    t=threading.Thread(target=target,args=args,daemon=True); t.start(); return t
+
+def _launch_gui():
+    try:
+        import tkinter as tk
+        from tkinter import ttk,filedialog,messagebox,scrolledtext
+    except ImportError:
+        _interactive_menu_cmd(); return
+
+    # ── 颜色 & 字体 ──────────────────────────────────────────
+    BG='#F5F4F0'; PANEL='#ECEAE4'; WHITE='#FFFFFF'
+    BLUE='#185FA5'; BLUE_H='#0C447C'; DONE='#3B6D11'
+    TEXT='#1A1A1A'; MUTED='#6B6B6B'; BORDER='#CFCDC6'
+    FNT=('Microsoft YaHei UI','10'); FNT_B=('Microsoft YaHei UI','10','bold')
+    FNT_H=('Microsoft YaHei UI','13','bold'); FNT_S=('Microsoft YaHei UI','9')
+    FNT_MONO=('Consolas','9')
+
+    root=tk.Tk(); root.title('金蝶 KIS 多年账套科目标准化工具')
+    root.configure(bg=BG); root.resizable(False,False)
+    W,H=860,580; root.geometry('%dx%d+%d+%d'%(W,H,(root.winfo_screenwidth()-W)//2,(root.winfo_screenheight()-H)//2))
+
+    # ── 左侧步骤栏 ────────────────────────────────────────────
+    STEPS=[('检查环境','① 环境'),('整理源文件','② 源文件'),('扫描账套','③ 扫描'),
+           ('审核映射表','④ 映射'),('试运行','⑤ 试运行'),('正式写入','⑥ 写入')]
+    cur_step=tk.IntVar(value=0); step_done=[tk.BooleanVar(value=False) for _ in STEPS]
+
+    sidebar=tk.Frame(root,bg=PANEL,width=168); sidebar.pack(side='left',fill='y'); sidebar.pack_propagate(False)
+    tk.Label(sidebar,text='操作步骤',bg=PANEL,fg=MUTED,font=FNT_S,anchor='w').pack(fill='x',padx=14,pady=(14,6))
+    step_btns=[]
+    def make_step_btn(i,label):
+        f=tk.Frame(sidebar,bg=PANEL,cursor='hand2')
+        f.pack(fill='x',padx=8,pady=2)
+        circ=tk.Label(f,text=str(i+1),bg=BORDER,fg=MUTED,font=FNT_S,width=2,relief='flat')
+        circ.pack(side='left',padx=(4,6),pady=6)
+        lbl=tk.Label(f,text=label,bg=PANEL,fg=MUTED,font=FNT,anchor='w')
+        lbl.pack(side='left',fill='x',expand=True)
+        def on_click(ev,idx=i): go_step(idx)
+        for w in (f,circ,lbl): w.bind('<Button-1>',on_click)
+        step_btns.append((f,circ,lbl))
+    for i,(long,short) in enumerate(STEPS): make_step_btn(i,long)
+
+    def refresh_sidebar():
+        s=cur_step.get()
+        for i,(f,circ,lbl) in enumerate(step_btns):
+            if step_done[i].get():
+                circ.config(bg=DONE,fg='#C8E6A0',text='✓'); lbl.config(fg=TEXT); f.config(bg=PANEL)
+            elif i==s:
+                circ.config(bg=BLUE,fg='#B5D4F4',text=str(i+1)); lbl.config(fg=TEXT,font=FNT_B); f.config(bg=WHITE)
+            else:
+                circ.config(bg=BORDER,fg=MUTED,text=str(i+1)); lbl.config(fg=MUTED,font=FNT); f.config(bg=PANEL)
+
+    # ── 右侧内容区 ────────────────────────────────────────────
+    content=tk.Frame(root,bg=WHITE); content.pack(side='left',fill='both',expand=True)
+    # 进度条
+    prog_bg=tk.Frame(content,bg=BORDER,height=3); prog_bg.pack(fill='x',side='top')
+    prog_fill=tk.Frame(prog_bg,bg=BLUE,height=3); prog_fill.place(x=0,y=0,relheight=1,relwidth=1/len(STEPS))
+
+    scroll_outer=tk.Frame(content,bg=WHITE); scroll_outer.pack(fill='both',expand=True)
+    canvas=tk.Canvas(scroll_outer,bg=WHITE,highlightthickness=0)
+    vsb=ttk.Scrollbar(scroll_outer,orient='vertical',command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side='right',fill='y'); canvas.pack(side='left',fill='both',expand=True)
+    inner=tk.Frame(canvas,bg=WHITE); inner_id=canvas.create_window((0,0),window=inner,anchor='nw')
+    def on_resize(ev): canvas.itemconfig(inner_id,width=ev.width)
+    canvas.bind('<Configure>',on_resize)
+    inner.bind('<Configure>',lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+
+    nav=tk.Frame(content,bg=WHITE,pady=10); nav.pack(fill='x',side='bottom',padx=20)
+    tk.Frame(nav,bg=BORDER,height=1).pack(fill='x',pady=(0,10))
+    btn_prev=tk.Button(nav,text='← 上一步',command=lambda:go_step(cur_step.get()-1),font=FNT,bg=WHITE,fg=MUTED,relief='solid',bd=1,padx=14,pady=5,cursor='hand2')
+    btn_prev.pack(side='left')
+    btn_next=tk.Button(nav,text='下一步 →',font=FNT_B,bg=BLUE,fg='#E6F1FB',relief='flat',padx=18,pady=5,cursor='hand2',activebackground=BLUE_H,activeforeground='#E6F1FB')
+    btn_next.pack(side='right')
+
+    # ── 输入变量 ──────────────────────────────────────────────
+    v_src=tk.StringVar(); v_work=tk.StringVar(); v_map=tk.StringVar()
+    v_out=tk.StringVar(); v_mode=tk.StringVar(value='dryrun')
+    log_widget=None
+
+    # ── 页面渲染 ──────────────────────────────────────────────
+    def clear_inner():
+        for w in inner.winfo_children(): w.destroy()
+
+    def lbl(parent,text,size=10,bold=False,color=None,wrap=0,pady=0):
+        f=('Microsoft YaHei UI',size,'bold' if bold else '')
+        kw=dict(text=text,bg=WHITE,fg=color or TEXT,font=f,anchor='w',justify='left')
+        if wrap: kw['wraplength']=wrap
+        tk.Label(parent,**kw).pack(fill='x',padx=24,pady=(pady,0))
+
+    def sep(parent): tk.Frame(parent,bg=BORDER,height=1).pack(fill='x',padx=24,pady=8)
+
+    def entry_row(parent,label,var,browse_dir=False,browse_file=False):
+        f=tk.Frame(parent,bg=WHITE); f.pack(fill='x',padx=24,pady=3)
+        tk.Label(f,text=label,bg=WHITE,fg=MUTED,font=FNT_S,width=18,anchor='w').pack(side='left')
+        e=tk.Entry(f,textvariable=var,font=FNT,bg='#F8F7F4',relief='solid',bd=1,width=38)
+        e.pack(side='left',padx=(4,4))
+        if browse_dir:
+            def pick(v=var): d=filedialog.askdirectory(); v.set(d) if d else None
+            tk.Button(f,text='浏览',command=pick,font=FNT_S,bg=PANEL,fg=TEXT,relief='solid',bd=1,padx=8,cursor='hand2').pack(side='left')
+        if browse_file:
+            def pickf(v=var): fp=filedialog.askopenfilename(filetypes=[('CSV','*.csv'),('所有文件','*')]); v.set(fp) if fp else None
+            tk.Button(f,text='浏览',command=pickf,font=FNT_S,bg=PANEL,fg=TEXT,relief='solid',bd=1,padx=8,cursor='hand2').pack(side='left')
+
+    def info_box(parent,text,kind='info'):
+        colors={'info':('#E6F1FB','#185FA5'),'warn':('#FAEEDA','#854F0B'),'ok':('#EAF3DE','#3B6D11')}
+        bg,fg=colors.get(kind,colors['info'])
+        f=tk.Frame(parent,bg=bg,bd=0); f.pack(fill='x',padx=24,pady=4)
+        tk.Label(f,text=text,bg=bg,fg=fg,font=FNT_S,anchor='w',justify='left',wraplength=580,padx=10,pady=8).pack(fill='x')
+
+    def check_row(parent,text,sub=''):
+        f=tk.Frame(parent,bg=WHITE); f.pack(fill='x',padx=24,pady=2)
+        tk.Label(f,text='✓',bg=WHITE,fg=DONE,font=FNT_B,width=2).pack(side='left')
+        tk.Label(f,text=text,bg=WHITE,fg=TEXT,font=FNT,anchor='w').pack(side='left')
+        if sub: tk.Label(f,text=sub,bg=WHITE,fg=MUTED,font=FNT_S).pack(side='left',padx=(4,0))
+
+    def render_step(s):
+        nonlocal log_widget
+        clear_inner()
+        prog_fill.place(relwidth=(s+1)/len(STEPS))
+        tag_f=tk.Frame(inner,bg=WHITE); tag_f.pack(fill='x',padx=24,pady=(20,4))
+        tag=tk.Label(tag_f,text='第%s步'%('一二三四五六'[s]),bg='#E6F1FB',fg='#185FA5',font=FNT_S,padx=10,pady=3,relief='flat')
+        tag.pack(side='left')
+
+        if s==0:
+            lbl(inner,'检查运行环境',13,True,pady=4)
+            lbl(inner,'打包工具依赖以下组件，缺一不可。',color=MUTED,wrap=600)
+            sep(inner)
+            check_row(inner,'Python 3.8+','（打包版已内置，无需单独安装）')
+            check_row(inner,'Microsoft Access ODBC 驱动','控制面板 → ODBC 数据源管理 → 驱动程序 确认存在')
+            check_row(inner,'System.mda','放在程序同级目录或"临时存储文件"子目录下')
+            info_box(inner,'提示：ODBC 驱动与 Office 位数必须一致。32 位账套文件建议使用 x86 版本程序。','warn')
+            btn_next.config(text='下一步 →',command=lambda:go_step(1))
+
+        elif s==1:
+            lbl(inner,'整理源文件目录',13,True,pady=4)
+            lbl(inner,'扫描前确认账套文件的目录结构，工具从父目录名或文件名自动提取年份。',color=MUTED,wrap=600)
+            sep(inner)
+            lbl(inner,'推荐结构：',bold=True)
+            code=tk.Text(inner,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=7,relief='flat',bd=0,state='normal',wrap='none')
+            code.pack(fill='x',padx=24,pady=6)
+            code.insert('end','账套原始文件/\n  ├── 2021/\n  │   ├── 上马村.Ais\n  │   └── 下马村.Ais\n  ├── 2022/\n  │   └── 上马村.Ais\n  └── 2023/\n      └── 上马村.Ais')
+            code.config(state='disabled')
+            info_box(inner,'输出副本目录需提前建好，且必须为空。副本文件名自动加年份：上马村_2021.Ais、上马村_2022.Ais …')
+            btn_next.config(text='下一步 →',command=lambda:go_step(2))
+
+        elif s==2:
+            lbl(inner,'扫描账套',13,True,pady=4)
+            lbl(inner,'只读扫描，不修改源文件。扫描后生成 mapping_draft.csv 等 CSV 文件，供下一步审核。',color=MUTED,wrap=600)
+            sep(inner)
+            entry_row(inner,'账套文件夹',v_src,browse_dir=True)
+            entry_row(inner,'工作目录（输出CSV）',v_work,browse_dir=True)
+            info_box(inner,'提示：工作目录可以和账套目录不同，建议新建一个空文件夹。')
+            sep(inner)
+            log_f=tk.Frame(inner,bg=WHITE); log_f.pack(fill='x',padx=24)
+            log_widget=scrolledtext.ScrolledText(log_f,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=6,state='disabled',wrap='word',relief='flat',bd=0)
+            log_widget.pack(fill='x')
+            def do_scan():
+                if not v_src.get() or not v_work.get():
+                    messagebox.showwarning('缺少路径','请填写账套文件夹和工作目录'); return
+                btn_next.config(state='disabled',text='扫描中…')
+                def run():
+                    sys.argv=['','scan-kis','--input',v_src.get(),'--out',v_work.get()]
+                    try:
+                        import io; buf=io.StringIO()
+                        old_out=sys.stdout; sys.stdout=buf
+                        main()
+                        sys.stdout=old_out
+                        out_txt=buf.getvalue()
+                    except SystemExit: sys.stdout=old_out; out_txt=buf.getvalue() if 'buf' in dir() else ''
+                    except Exception as ex: sys.stdout=old_out; out_txt='错误：'+str(ex)
+                    def done():
+                        log_widget.config(state='normal'); log_widget.delete('1.0','end')
+                        log_widget.insert('end',out_txt or '（无输出）'); log_widget.config(state='disabled')
+                        step_done[2].set(True); refresh_sidebar()
+                        btn_next.config(state='normal',text='下一步 →')
+                    root.after(0,done)
+                _run_in_thread(run)
+            btn_next.config(text='开始扫描 ▶',command=do_scan)
+
+        elif s==3:
+            lbl(inner,'审核 mapping_draft.csv',13,True,pady=4)
+            lbl(inner,'用 Excel 打开工作目录中的 mapping_draft.csv，审核每一行，确认无误后在 confirmed 列填 Y。',color=MUTED,wrap=600)
+            sep(inner)
+            lbl(inner,'重点列说明：',bold=True)
+            rows=[('action','建议操作类型：keep / rename / recode / map_to_existing / create_year_dedicated_child'),
+                  ('old_code → new_code','原编码到目标编码，两者相同表示只改名称'),
+                  ('new_name','可手动修改，写入时以此为准'),
+                  ('confirmed','审核通过填 Y，否则该行跳过'),
+                  ('conflict_type','有冲突时系统会注明原因，需人工判断')]
+            for col,tip in rows:
+                f=tk.Frame(inner,bg=WHITE); f.pack(fill='x',padx=24,pady=2)
+                tk.Label(f,text=col,bg='#F0EEE8',fg='#185FA5',font=('Consolas',9),padx=6,pady=2,relief='flat').pack(side='left')
+                tk.Label(f,text=tip,bg=WHITE,fg=MUTED,font=FNT_S,anchor='w',wraplength=460,justify='left').pack(side='left',padx=8)
+            info_box(inner,'不要删除任何行，不需执行的行将 confirmed 留空即可。','warn')
+            def open_csv():
+                p=Path(v_work.get())/'mapping_draft.csv'
+                if p.exists(): os.startfile(str(p))
+                else: messagebox.showinfo('未找到','先完成第三步扫描，再打开文件')
+            sep(inner)
+            tk.Button(inner,text='📄  打开 mapping_draft.csv',command=open_csv,font=FNT,bg=PANEL,fg=TEXT,relief='solid',bd=1,padx=12,pady=6,cursor='hand2').pack(anchor='w',padx=24)
+            btn_next.config(text='已审核，下一步 →',command=lambda:(step_done[3].set(True),refresh_sidebar(),go_step(4)))
+
+        elif s==4:
+            lbl(inner,'试运行（dry-run）',13,True,pady=4)
+            lbl(inner,'只做预检，不复制文件、不写入任何数据。有阻断项时会列出原因，修改映射表后重新试运行。',color=MUTED,wrap=600)
+            sep(inner)
+            entry_row(inner,'mapping_draft.csv',v_map,browse_file=True)
+            entry_row(inner,'输出副本目录',v_out,browse_dir=True)
+            info_box(inner,'输出目录必须为空，否则预检会报"同名副本已存在"错误。')
+            sep(inner)
+            log_f2=tk.Frame(inner,bg=WHITE); log_f2.pack(fill='x',padx=24)
+            log_widget=scrolledtext.ScrolledText(log_f2,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=7,state='disabled',wrap='word',relief='flat',bd=0)
+            log_widget.pack(fill='x')
+            def do_dryrun():
+                if not v_map.get() or not v_out.get():
+                    messagebox.showwarning('缺少路径','请填写映射文件和输出目录'); return
+                btn_next.config(state='disabled',text='试运行中…')
+                def run():
+                    sys.argv=['','apply','--mapping',v_map.get(),'--out',v_out.get(),'--dry-run']
+                    try:
+                        import io; buf=io.StringIO(); old_out=sys.stdout; sys.stdout=buf
+                        main(); sys.stdout=old_out; out_txt=buf.getvalue()
+                    except SystemExit: sys.stdout=old_out; out_txt=buf.getvalue() if 'buf' in dir() else ''
+                    except Exception as ex: sys.stdout=old_out; out_txt='错误：'+str(ex)
+                    def done():
+                        log_widget.config(state='normal'); log_widget.delete('1.0','end')
+                        log_widget.insert('end',out_txt or '（无输出）'); log_widget.config(state='disabled')
+                        step_done[4].set(True); refresh_sidebar()
+                        btn_next.config(state='normal',text='查看报告，下一步 →')
+                    root.after(0,done)
+                _run_in_thread(run)
+            btn_next.config(text='开始试运行 ▶',command=do_dryrun)
+
+        elif s==5:
+            lbl(inner,'正式写入',13,True,pady=4)
+            lbl(inner,'工具会先把源账套复制到输出目录，再在副本上修改，原始文件完全不动。',color=MUTED,wrap=600)
+            sep(inner)
+            info_box(inner,'⚠  写入前请确认：① 预检无阻断项（preflight_report.csv 无 blocked_commit=Y）② 输出目录为空','warn')
+            sep(inner)
+            log_f3=tk.Frame(inner,bg=WHITE); log_f3.pack(fill='x',padx=24)
+            log_widget=scrolledtext.ScrolledText(log_f3,font=FNT_MONO,bg='#F5F4F0',fg=TEXT,height=8,state='disabled',wrap='word',relief='flat',bd=0)
+            log_widget.pack(fill='x')
+            def do_commit():
+                if not messagebox.askyesno('确认写入','将正式修改账套副本，无法撤销。确认继续？'): return
+                if not v_map.get() or not v_out.get():
+                    messagebox.showwarning('缺少路径','请先完成第五步填写路径'); return
+                btn_next.config(state='disabled',text='写入中…')
+                def run():
+                    sys.argv=['','apply','--mapping',v_map.get(),'--out',v_out.get(),'--commit']
+                    try:
+                        import io; buf=io.StringIO(); old_out=sys.stdout; sys.stdout=buf
+                        main(); sys.stdout=old_out; out_txt=buf.getvalue()
+                    except SystemExit: sys.stdout=old_out; out_txt=buf.getvalue() if 'buf' in dir() else ''
+                    except Exception as ex: sys.stdout=old_out; out_txt='错误：'+str(ex)
+                    def done():
+                        log_widget.config(state='normal'); log_widget.delete('1.0','end')
+                        log_widget.insert('end',out_txt or '（无输出）'); log_widget.config(state='disabled')
+                        step_done[5].set(True); refresh_sidebar()
+                        btn_next.config(state='normal',text='完成 ✓')
+                        if '完成' in out_txt or 'ok' in out_txt.lower():
+                            def open_out():
+                                p=Path(v_out.get())
+                                if p.exists(): os.startfile(str(p))
+                            messagebox.showinfo('写入完成','副本已生成，点击确定打开输出目录。')
+                            open_out()
+                    root.after(0,done)
+                _run_in_thread(run)
+            btn_next.config(text='确认写入 ▶',command=do_commit,bg='#3B6D11',activebackground='#27500A')
+
+        btn_prev.config(state='normal' if s>0 else 'disabled')
+        refresh_sidebar()
+        canvas.yview_moveto(0)
+
+    def go_step(s):
+        s=max(0,min(len(STEPS)-1,s))
+        cur_step.set(s); render_step(s)
+
+    go_step(0)
+    root.mainloop()
+
+def _interactive_menu_cmd():
+    """tkinter 不可用时的 CMD 回退。"""
     SEP='='*60
     print(SEP)
     print('  金蝶 KIS 多年账套科目标准化工具')
@@ -833,35 +1115,22 @@ def _interactive_menu():
     print('  请选择操作：')
     print('  [1] scan-kis   扫描账套，生成映射草稿')
     print('  [2] apply      将映射表写入账套副本（含试运行）')
-    print('  [3] make-config  生成配置文件模板')
     print('  [Q] 退出')
     print()
     choice=input('  输入序号后按回车：').strip().upper()
     if choice=='Q' or choice=='': return
     if choice=='1':
-        src=input('  账套文件夹路径（含所有年份子目录）：').strip().strip('"')
-        out=input('  工作目录（输出 CSV 的位置）：').strip().strip('"')
-        sys.argv=['',  'scan-kis','--input',src,'--out',out]
+        src=input('  账套文件夹路径：').strip().strip('"')
+        out=input('  工作目录：').strip().strip('"')
+        sys.argv=['','scan-kis','--input',src,'--out',out]
     elif choice=='2':
-        print()
-        print('  [1] 试运行 (dry-run) —— 只预检，不修改任何文件（推荐先做）')
-        print('  [2] 正式写入 (commit) —— 复制账套并写入')
-        mode=input('  选择模式：').strip()
-        mapping=input('  mapping_draft.csv 的完整路径：').strip().strip('"')
-        out=input('  输出副本目录（必须为空）：').strip().strip('"')
-        if mode=='2':
-            sys.argv=['','apply','--mapping',mapping,'--out',out,'--commit']
-        else:
-            sys.argv=['','apply','--mapping',mapping,'--out',out,'--dry-run']
-    elif choice=='3':
-        out=input('  config.json 输出完整路径：').strip().strip('"')
-        sys.argv=['','make-config','--out',out]
+        mode=input('  [1]试运行  [2]正式写入：').strip()
+        mapping=input('  mapping_draft.csv 路径：').strip().strip('"')
+        out=input('  输出副本目录：').strip().strip('"')
+        sys.argv=['','apply','--mapping',mapping,'--out',out,('--commit' if mode=='2' else '--dry-run')]
     else:
-        print('  无效选项。')
-        _pause_if_frozen()
-        return
-    print()
-    main()
+        print('  无效选项。'); _pause_if_frozen(); return
+    print(); main()
 
 def main():
     p=argparse.ArgumentParser(description='金蝶 KIS 多年账套科目标准化工具')
@@ -874,9 +1143,9 @@ def main():
 
 if __name__=='__main__':
     try:
-        # 双击 exe 或本地无参数运行时，进入交互菜单，避免窗口一闪而过
+        # 双击 exe 或本地无参数运行时，进入图形向导，避免窗口一闪而过
         if len(sys.argv)<=1:
-            _interactive_menu()
+            _launch_gui()
         else:
             main()
         _pause_if_frozen('完成。按回车键关闭窗口...')

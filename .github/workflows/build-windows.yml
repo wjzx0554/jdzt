@@ -51,7 +51,7 @@ jobs:
       - name: Build KISZT EXE
         shell: cmd
         run: |
-          pyinstaller --clean --noconfirm --onefile --console --name KISZT_${{ matrix.suffix }} --hidden-import pyodbc kiszt.py
+          pyinstaller --clean --noconfirm --onefile --noconsole --name KISZT_${{ matrix.suffix }} --hidden-import pyodbc kiszt.py
 
       - name: Prepare release folder
         shell: cmd
